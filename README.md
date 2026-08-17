@@ -4,7 +4,7 @@
 An in-progress experiment that I am designing under the supervision of Dr. Miguel Nacenta, from UVIC. This repository features an experimental script designed in Python with PsychoPy, and the current build of an EEG cognitive load classifier I am developing. In addition to what is provided in this repository, **I have also created a formal research proposal as well as long-form presentation, and both of these are available on request** for more information about this upcoming study!
 
 ## The Experimental Script
-The experiment itself is "experiment.py", and can be run simply using "python3 experiment.py" in the command line. This will create a window containing the experiment, which can be interacted with through clicks, and in some cases, keyboard input. The experiment is designed to test users on three experimental conditions, across two task difficulties. The experiment also features support for EEG (gNautilus), fNIRS (NIRx), and eye-tracking (EyeLink) data collection, and provides a .csv file containing behavioural data. 
+The experiment is designed to test users on three experimental conditions, across two task difficulties. It features support for EEG (gNautilus), fNIRS (NIRx), and eye-tracking (EyeLink) data collection, and provides a .csv file containing behavioural data. 
 
 ### Getting It Running
 This project targets Python 3.10, as PsychoPy and several of its dependencies do not yet support newer Python releases on Windows.
