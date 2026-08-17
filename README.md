@@ -10,11 +10,14 @@ The experiment itself is "experiment.py", and can be run simply using "python3 e
 This project targets Python 3.10, as PsychoPy and several of its dependencies do not yet support newer Python releases on Windows.
 
 **1.** Install Python 3.10 if not already available.
+
 **2.** Create and activate a virtual environment:
    python -m venv .venv
    .venv\Scripts\activate
+   
 **3.** Install dependencies:
    pip install -r requirements.txt
+   
 **4.** Run the experiment:
    python experiment.py
 
