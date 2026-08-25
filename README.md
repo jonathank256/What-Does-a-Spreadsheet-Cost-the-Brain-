@@ -24,7 +24,16 @@ This project targets Python 3.10, as PsychoPy and several of its dependencies do
 A window will open on launch; the experiment is controlled via mouse clicks and, for some conditions, keyboard input. Behavioural data is written to .csv files on completion.
 
 ## The Classifier (In Progress)
-The data collected with this experiment will be used to train a classifier to identify different categories of cognitive load, across the experimental conditions and by their difficulties. The current build of the classifier is trained on EEG data, and two forms exist within the script which are currently being tested: one utilizing a build of BIOT (Yang, Westover, & Sun, 2023), and the other a modified form of the EEGNet framework (Lawhern et al., 2018). Currently, a set of data collected from Dr. Nacenta's lab is being utilized to make improvements to the classifier, as the classification will occur only once on real experimental data. The classifier currently utilizes the LOSO method of training, but this is subject to change with further improvements, which I am continuing to make. Eventually, the goal is to have a single classifier that can use all collected modalities to make the most informed decision possible.
+The data collected with this experiment will be used to train a classifier to identify different categories of cognitive load across the experimental conditions and their difficulties. The current build is being developed and iterated on using a pilot EEG dataset from the VIXI Lab at UVIC, as classification on the real experimental data will only happen once when data collection concludes.
+
+The pipeline currently compares three approaches: a band-power + logistic regression baseline, a modified EEGNet framework (Lawhern et al., 2018), and BIOT (Yang, Westover, & Sun, 2023), a large pretrained biosignal model fine-tuned on our data. The baseline acts as a floor: if the deep models can't beat it, they aren't learning anything the hand-crafted band-power features didn't already capture.
+
+Two data segmentations are supported: fixed-length windows (required for EEGNet) and variable-length full-trial segments per paragraph (BIOT only). Cross-validation is leave-one-subject-out (LOSO), the methodologically correct standard for this task. A leave-one-trial-out (LOTO) mode is also kept in the pipeline purely as a diagnostic. 
+
+**Upcoming changes:** early stopping currently monitors loss on the held-out LOSO fold, which means model selection has implicit access to the test set. Restructuring this (e.g. via a proper train/val/test split within each fold) is a planned fix.
+
+Eventually, the goal is to have a single classifier that can use all collected modalities (EEG, 
+fNIRS, eye-tracking) together to make the most informed decision possible.
 
 ## References
 Lawhern, V. J., Solon, A. J., Waytowich, N. R., Gordon, S. M., Hung, C. P., & Lance, B. J. (2018). EEGNet: A compact convolutional neural network for EEG-based brain–computer interfaces. Journal of Neural Engineering, 15(5), 056013. https://doi.org/10.1088/1741-2552/aace8c
