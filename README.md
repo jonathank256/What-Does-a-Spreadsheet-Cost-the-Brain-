@@ -1,5 +1,7 @@
 # What-Does-a-Spreadsheet-Cost-the-Brain-
 
+Status: Classifier In Progress
+
 ## Summary
 An in-progress experiment that I am designing under the supervision of Dr. Miguel Nacenta, from UVic. This repository features an experimental script designed in Python with PsychoPy, and the current build of an EEG cognitive load classifier I am developing. In addition to what is provided in this repository, **I have also created a formal research proposal as well as a long-form presentation, and both of these are available on request** for more information about this upcoming study!
 
