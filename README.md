@@ -34,7 +34,7 @@ from the VIXI Lab at UVic, recorded for a separate study, as classification on t
 
 The pipeline currently compares three approaches: a band-power + logistic regression baseline, a modified EEGNet framework (Lawhern et al., 2018), and BIOT (Yang, Westover, & Sun, 2023), a large pretrained biosignal model fine-tuned on our data. The baseline acts as a floor: if the deep models can't beat it, they aren't learning anything the hand-crafted band-power features didn't already capture. 
 
-Two data segmentations are supported: fixed-length windows (required for EEGNet) and variable-length full-trial segments per paragraph (BIOT only). Cross-validation is leave-one-subject-out (LOSO), the methodologically correct standard for this task. A leave-one-trial-out (LOTO) mode is also kept in the pipeline purely as a diagnostic. The modified EEGNet currently reaches ~0.60 balanced accuracy under LOSO across 24 subjects, against ~0.53 for the baseline. LOTO reaches ~0.69, which reflects subject-identity leakage and is why it is not used for evaluation.
+Two data segmentations are supported: fixed-length windows (required for EEGNet) and variable-length full-trial segments per paragraph (BIOT only). Cross-validation is leave-one-subject-out (LOSO), the methodologically correct standard for this task. A leave-one-trial-out (LOTO) mode is also kept in the pipeline purely as a diagnostic. LOTO reaches ~0.73, which reflects subject-identity leakage and is why it is not used for evaluation. LOSO results are currently being run.
 
 Eventually, the goal is to have a single classifier that can use all collected modalities (EEG, fNIRS, eye-tracking) together to make the most informed decision possible.
 
