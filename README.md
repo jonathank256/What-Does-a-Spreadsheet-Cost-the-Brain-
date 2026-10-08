@@ -30,8 +30,6 @@ The pipeline currently compares three approaches: a band-power + logistic regres
 
 Two data segmentations are supported: fixed-length windows (required for EEGNet) and variable-length full-trial segments per paragraph (BIOT only). Cross-validation is leave-one-subject-out (LOSO), the methodologically correct standard for this task. A leave-one-trial-out (LOTO) mode is also kept in the pipeline purely as a diagnostic. 
 
-**Upcoming changes:** early stopping currently monitors loss on the held-out LOSO fold, which means model selection has implicit access to the test set. Restructuring this (e.g. via a proper train/val/test split within each fold) is a planned fix.
-
 Eventually, the goal is to have a single classifier that can use all collected modalities (EEG, 
 fNIRS, eye-tracking) together to make the most informed decision possible.
 
