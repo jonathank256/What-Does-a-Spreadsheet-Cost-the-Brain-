@@ -12,7 +12,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg") # non-interactive backend, just save figures to disk
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import mne
@@ -27,7 +27,7 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.constraints import max_norm
 from tensorflow.keras.regularizers import l2
 
-from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.model_selection import LeaveOneGroupOut, GroupShuffleSplit
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -42,10 +42,7 @@ from braindecode.models import InterpolatedBIOT
 mne.set_log_level("WARNING")
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# raw EEG CSVs in the test dataset label channels generically (C1-C8) based on
-# the amplifier's physical input order, not electrode scalp position. This
-# re-maps each input channel to the actual 10-20 system electrode name
-# so MNE can use standard montage-based processing (filtering, ICA)
+
 CH_MAP = {
     "C1": "Fp1", "C2": "Fp2", "C3": "Fz", "C4": "Cz",
     "C5": "PO7", "C6": "O1", "C7": "O2", "C8": "PO8",
@@ -55,41 +52,32 @@ EEG_COLS = list(CH_MAP.keys())
 
 @dataclass
 class Config:
-    """
-    All tunable parameters for the EEG pipeline.
-
-    Two independent axes control what the pipeline does:
-    - data_mode: 'windowed' (fixed-length sliding windows, required for EEGNet),
-    vs. 'full_trial' (variable length per-paragraph segments, BIOT only)
-    - cv_level: 'subject (LOSO)' vs. 'trial', (LOTO for diagnostic purposes, inflates
-    scores due to leakage as subjects other trials are trained)
-    """
     data_root: str = r"Experiment Anonymised Version"
     labels_csv: str = r"Experiment Anonymised Version\Users 001-025.csv"
-    fk_threshold: float | None = None # None: derive from median FK split (see load_fk_labels)
+    fk_threshold: float | None = None
     excluded_subjects: tuple = ("User021",)  # bad electrode session: every recording amp-rejected
 
     data_mode: Literal["windowed", "full_trial"] = "windowed"
     cv_level: Literal["subject", "trial"] = "subject"
 
-    l_freq: float = 1.0 # high-pass cutoff, Hz
-    h_freq: float = 40.0 # low-pass cutoff, Hz
-    notch: float = 60.0 # mains-hum notch filter, Hz
+    l_freq: float = 1.0
+    h_freq: float = 40.0
+    notch: float = 60.0
 
     use_ica: bool = True
     ica_components: int = 6
-    reject_uv: float = 750.0 # amplitude-based artifact rejection threshold, microvolts
-    ica_min_sfreq: float = 30.0 # ICA skipped below this SR as unreliable
+    reject_uv: float = 750.0
+    ica_min_sfreq: float = 30.0
     ica_max_iter: int = 500
     ica_tol: float = 1e-3
 
     # windowed-mode only
-    target_sfreq: float = 128.0 # resample rate for EEGNet path      
-    window_s: float = 2.0 # window length, seconds
-    window_overlap: float = 0.25 # fractional overlap between consecutive windows
+    target_sfreq: float = 128.0      
+    window_s: float = 2.0
+    window_overlap: float = 0.25
 
     # full_trial-mode only
-    min_trial_s: float = 2.0 # trials shorter than this are dropped (s)          
+    min_trial_s: float = 2.0          
 
     run_eegnet: bool = True # auto-disabled if data_mode == "full_trial"
     run_biot: bool = True
@@ -100,20 +88,24 @@ class Config:
     biot_batch_size: int = 16 # windowed mode only; full_trial is always batch size 1
     biot_lr: float = 3e-5
     biot_patience: int = 5
-    # per-trial z-score before feeding BIOT. 
+    # per-trial z-score before feeding BIOT: our
     # signal sits at ~1e-5 to 1e-4 volt scale, but BIOT's
-    # pretraining pipeline treats normalization as a
+    # own pretraining pipeline treats normalization as a
     # required preprocessing step.
     biot_normalize: bool = True       
 
-    epochs: int = 200 # EEGNet max epochs
+    epochs: int = 200 # EEGNet
     batch_size: int = 32 # EEGNet
     lr: float = 5e-4 # EEGNet
     dropout_rate: float = 0.5
     patience: int = 8 # EEGNet early stopping
     l2_reg: float = 1e-4
     seed: int = 42
-    smoke: bool = False # if True, restrict to first 3 subjects for fast pipeline test
+    smoke: bool = True
+
+    # share of the TRAINING groups (subjects or trials) held out inside each fold
+    # for early stopping / best-weight selection. The test fold is never used for this.
+    val_fraction: float = 0.15
 
     out_dir_base: str = "results"
 
@@ -122,21 +114,10 @@ CFG = Config()
 
 
 def resolve_out_dir(cfg: Config) -> str:
-    """
-    Build the results directory name from current data_mode/cv_level
-    to prevent separate runs from overwriting past results. 
-    """
     return f"{cfg.out_dir_base}_{cfg.data_mode}_{cfg.cv_level}"
 
 
 def plot_loss_curves(histories: dict, model_name: str, cfg: Config):
-    """
-    Plot per-fold train/val loss curves (one line per LOSO fold coloured by fold
-    order) side by side, save to <out_dir>/loss_curves/.
-
-    histories: dictr mapping fold's held-out group name: {"traim": [...], "val": [...]}
-    model_name: used in the title and output filename (e.g. "EEGNet", "BIOT (windowed)")
-    """
     out_dir = resolve_out_dir(cfg)
     loss_dir = os.path.join(out_dir, "loss_curves")
     os.makedirs(loss_dir, exist_ok=True)
@@ -172,25 +153,9 @@ def plot_loss_curves(histories: dict, model_name: str, cfg: Config):
     plt.close(fig)
     print(f"  [plot] saved {model_name} loss curves -> {fname}")
 
-# =====================================================================================
 # Labels
-# =====================================================================================
 
 def load_fk_labels(csv_path, threshold=None):
-    """
-    Builds a binary difficulty label for each (participant, document) pair
-    from Flesch-Kincaid readability score (dataset specific).
-
-    Source CSV has one row per participant-document-question combo, so
-    FK score is duplicated across rows for same document; takes the first
-    occurence per document. If no threshold given, one is derived from median
-    FK score across documents (median split -> roughly balanced easy/hard classes)
-
-    Returns:
-        fk_lookup: dict mapping (pid, doc_id) -> 0 (easy) or 1 (hard)
-        doc_fk_scores: dict mapping doc_id -> raw FK score
-        threshold: FK score used as the easy/hard cutoff
-    """
     df = pd.read_csv(csv_path, header=0)
     df = df.dropna(subset=[df.columns[0]])
 
@@ -214,10 +179,6 @@ def load_fk_labels(csv_path, threshold=None):
 
 
 def extract_participant_id(user_id):
-    """
-    Normalize a raw folder-derived user id to zero-padded canonical form ('User7' -> 'User007')
-    for join key against labels CSV.
-    """
     m = re.match(r"User0*(\d+)", user_id)
     if not m:
         return user_id
@@ -225,15 +186,6 @@ def extract_participant_id(user_id):
 
 
 def extract_document_id(test_name, known_doc_ids):
-    """
-    Identify which document a test folder corresponds to. 
-
-    Tries an exact substring match against known_Doc_ids first, falls back
-    to a regex match on '<3 letters>_<2 digits>' document-code pattern
-    for cares where known_doc_ids isn't populated yet.
-
-    Currently always called with known_doc_ids=[] so always regex match. 
-    """
     for doc in known_doc_ids:
         if doc in test_name:
             return doc
@@ -242,10 +194,6 @@ def extract_document_id(test_name, known_doc_ids):
 
 
 def resolve_label_key(user_id, test_name, fk_lookup, doc_fk_scores):
-    """
-    Resolve a (participant, document) key for subject/test pair
-    and return only if a label exists for it in fk_lookup, otherwise None.
-    """
     pid = extract_participant_id(user_id)
     doc = extract_document_id(test_name, doc_fk_scores.keys())
     key = (pid, doc)
@@ -253,12 +201,6 @@ def resolve_label_key(user_id, test_name, fk_lookup, doc_fk_scores):
 
 
 def check_fk_distribution(subjects, fk_lookup, doc_fk_scores, threshold):
-    """
-    Sanity check: prints easy/hard label for every document, then reports
-    how many discovered subject/test recordings successfully resolve to a label
-    vs. how many are missing one, and why, plus overall class balance. Runs before
-    main pipeline so labeling problems are immediately apparent. 
-    """
     print(f"FK threshold (median split): {threshold:.2f}")
     for doc, fk in sorted(doc_fk_scores.items(), key=lambda x: x[1]):
         label = "hard" if fk > threshold else "easy"
@@ -279,26 +221,10 @@ def check_fk_distribution(subjects, fk_lookup, doc_fk_scores, threshold):
     print(s.value_counts().sort_index())
     return s
 
-# =====================================================================================
+
 # Subject/trial discovery, two-pass duplicate-recording dedup
-# =====================================================================================
 
 def find_subjects(cfg: Config):
-    """
-    Discover all usable (subject, test) recordings under data_root, resolving duplicates.
-
-    Runs two dedup passes:
-    - Pass A: within one recording folder, if multiple *_EEG_rawEEGData.csv files exist in
-    the same rec_dir (restarted session e.g.), keep the largest file.
-    - Pass B: across separate folder trees for same (participant, document) pair: if the same
-    participant appears to have recorded the same document more than once, keep largest.
-
-    Every dedup decision is printed as an [audit] line for traceable discovery.
-
-    Returns:
-        list of (user_id, test_name, eeg_csv_path, annotations_json_path) tuples, one per retained
-        recording.
-    """
     pattern = os.path.join(cfg.data_root, "User*")
     all_entries = []  # (user_id, test_dir, rec_dir, kept_eeg_csv, kept_size, ann_path)
 
@@ -315,7 +241,7 @@ def find_subjects(cfg: Config):
             print(f"  [skip] {user_id}: no EEG csv found")
             continue
 
-        # Pass A: check EEG csvs in same folder tree (same rec_dir): keep largest, drop smaller duplicates
+        # Pass A: check EEG csvs in same folder tree (same rec_dir) -- keep largest, drop smaller duplicates
         by_rec_dir = {}
         for eeg_csv in eeg_csvs:
             rec_dir = os.path.dirname(eeg_csv)
@@ -340,7 +266,7 @@ def find_subjects(cfg: Config):
                 continue
             all_entries.append((user_id, test_dir, rec_dir, kept, os.path.getsize(kept), ann_path))
 
-    # Pass B: multiple separated folder trees for the same (participant, document) 
+    # Pass B: multiple SEPARATE folder trees for the same (participant, document) pair checked
     by_key = {}
     for entry in all_entries:
         user_id, test_dir, rec_dir, kept, size, ann_path = entry
@@ -372,10 +298,6 @@ def find_subjects(cfg: Config):
 
 
 def estimate_sfreq(ts: np.ndarray) -> float:
-    """
-    Estimate the true sampling rate from raw timestamps (ms) rather than trusting nominal
-    device spec, due to potential dropped samples or drift. Computed as (n_samples - 1) / total_duration.
-    """
     duration_ms = ts[-1] - ts[0]
     n_intervals = len(ts) - 1
     if duration_ms <= 0 or n_intervals <= 0:
@@ -384,14 +306,6 @@ def estimate_sfreq(ts: np.ndarray) -> float:
 
 
 def remove_blinks_ica(raw, cfg: Config):
-    """
-    Remove eye-blink artifacts via ICA.
-
-    Fits ICA on a 1Hz-high-passed copy of the data (ICA is sensitive to slow drifts, so a stricter high-pass
-    than the main pipeline filter is used just for fitting; the resulting unmixing is then applied to the original,
-    non-refiltered 'raw'). Blink components identified via correlating each component against frontal channels Fp1 and
-    Fp2 (nearest electrodes to eyes) via MNE's find_bads_eog, then excluded before signal reconstruction.
-    """
     ica = mne.preprocessing.ICA(
         n_components=cfg.ica_components,
         method="fastica",
@@ -415,22 +329,6 @@ def remove_blinks_ica(raw, cfg: Config):
 
 
 def _preprocess_raw(eeg_csv: str, cfg: Config, target_sfreq: float):
-    """
-    Load one raw EEG CSV and run the full preprocessing chain: build an MNE Raw object, resample
-    to target sfreq, band-pass and notch filter, and optionally remove blinks with ICA.
-
-    When a recording's estimated SR is unsually low, several steps degrade gracefully rather than a
-    hard-fail:
-    - filtering is skipped entirely if sfreq is too low to support even low end of the bandpass (l_freq)
-    - h_freq is clamped down toward Nyquist limit if needed
-    - the notch filter is skipped if sfreq is too low to support it
-    - ICA is skipped if sfreq is below cfg.ica_min_sfreq
-    These skips are all logged.
-
-    Returns:
-        (signal, timestamps, sfreq) as (n_ch, n_samples) array, raw ms timestamps, and the final (possibly resampled)
-        SR, or (None, None, None) if file is unusable due to missing columns, too few samples, very low sfreq.
-    """
     eeg = pd.read_csv(eeg_csv)
     eeg.columns = [c.strip() for c in eeg.columns]
 
@@ -484,27 +382,11 @@ def _preprocess_raw(eeg_csv: str, cfg: Config, target_sfreq: float):
 
 
 def load_subject(eeg_csv: str, ann_path: str, cfg: Config, doc_label: int, target_sfreq: float):
-    """
-    Preprocess one recording and segment it into model-ready trials/windows, aligned to the paragraph timing in 
-    annotations.json.
-
-    Paragraph on/off times in annotations.json are relative to the first valid paragraph's start (t0), not the 
-    recording's absolute start, so all timestamps are converted to sample offsets relative to t0 before slicing.
-
-    Behavior depends on cfg.data_mode:
-    - 'windowed': each paragraph's time range is cut into fixed-length, overlapping windows (cfg.window_s, 
-    cfg.window_overlap). Paragraphs shorter than one window are dropped entirely; any window containing
-    a sample exceeding cfg.reject_uv is rejected as an artifact.
-    - 'full_trial': each paragraph becomes one variable-length trial (no windowing). Paragraphs shorter than 
-    cfg.min_trial_s are dropped; the same amplitude-based rejection applies to the whole trial.
-
-    Every window/trial in a given recording inherits the same doc_label, since document difficulty, not paragraph, 
-    is the label of interest.
-
-    Returns:
-        (Xs, ys, sfreq): Xs is a list of (n_ch, T) float32 arrays (T fixed in windowed mode, variable in full_trial mode); 
-        ys is doc_label repeated len(Xs) times. Returns (None, None, None) if preprocessing fails or no usable windows/trials 
-        survive.
+    """Returns (Xs, ys, sfreq):
+      windowed   -> Xs: list of (n_ch, win_n) arrays, one per window
+      full_trial -> Xs: list of (n_ch, variable_T) arrays, one per paragraph
+    ys is a plain list of doc_label repeated len(Xs) times, since every
+    item from one subfolder/test instance shares the same document label.
     """
     sig, ts, sfreq = _preprocess_raw(eeg_csv, cfg, target_sfreq)
     if sig is None:
@@ -574,34 +456,12 @@ def load_subject(eeg_csv: str, ann_path: str, cfg: Config, doc_label: int, targe
 
     return Xs, np.array(ys, dtype=int), sfreq
 
-# =====================================================================================
-# Dataset assembly
-# =====================================================================================
+
+# Dataset assembly: returns BOTH subject-level and trial-level group
+# arrays , so cv_level can be chosen at train time without
+# rebuilding the dataset.
 
 def build_dataset(cfg: Config, target_sfreq: float):
-    """
-    Assemble the full dataset across all subjects: discover recordings, resolve FK labels, preprocess and 
-    segment each one, and concatenate into pooled arrays.
-
-    Builds BOTH subject-level and trial-level group arrays (subj_groups, trial_groups) up front regardless of cfg.cv_level, 
-    so the caller can choose leave-one-subject-out vs. leave-one-trial-out at train time (via select_groups) without rebuilding 
-    the dataset for each comparison.
-
-    Recordings with no resolvable FK label, or that produce no usable windows/trials, are skipped and logged. Raises if no 
-    subjects are found on disk, if no recording yields any usable data, or if subjects don't agree on channel count 
-    (montage mismatch).
-
-    Behavior depends on cfg.data_mode:
-    - 'windowed': windows are stacked into one dense (n, ch, T) array. If subjects ended up with slightly different window 
-    lengths (can happen from sfreq-dependent rounding), all windows are cropped to the shortest length found, with a warning.
-    - 'full_trial': trials are kept as a ragged Python list of (ch, T) arrays, since lengths vary per paragraph and can't be 
-    stacked.
-
-    Returns:
-        (X, y, subj_groups, trial_groups, mean_sfreq) -- X is either a stacked ndarray (windowed) or a list of arrays (full_trial);
-        y, subj_groups, trial_groups are 1D arrays aligned to X; mean_sfreq is the average estimated sampling rate across all 
-        source recordings (used downstream for BIOT model construction and band-power feature extraction).
-    """
     subjects = find_subjects(cfg)
     if not subjects:
         raise FileNotFoundError(
@@ -682,29 +542,29 @@ def build_dataset(cfg: Config, target_sfreq: float):
 
 
 def select_groups(subj_groups: np.ndarray, trial_groups: np.ndarray, cfg: Config) -> np.ndarray:
-    """
-    Pick which grouping array LeaveOneGroupOut should split on, based on cfg.cv_level: 'subject' groups 
-    or 'trial' groups. Note again that trial is for testing and creates leakage of other trials from
-    test participant.
-    """
     return subj_groups if cfg.cv_level == "subject" else trial_groups
 
-# =====================================================================================
+
+def inner_val_split(groups_tr: np.ndarray, y_tr: np.ndarray, cfg: Config):
+    """
+    Splits one fold's TRAINING data into fit / validation index arrays, by group,
+    so that early stopping and best-weight selection never see the held-out test
+    fold. Whole groups (subjects or trials, matching cfg.cv_level) go to one side
+    only. Retries with a different seed until the validation side has both classes.
+    """
+    idx = np.arange(len(groups_tr))
+    for attempt in range(50):
+        gss = GroupShuffleSplit(n_splits=1, test_size=cfg.val_fraction,
+                                random_state=cfg.seed + attempt)
+        fit_idx, val_idx = next(gss.split(idx, y_tr, groups_tr))
+        if len(np.unique(y_tr[val_idx])) == 2 and len(np.unique(y_tr[fit_idx])) == 2:
+            return fit_idx, val_idx
+    raise RuntimeError("Could not build a validation split containing both classes.")
+
 # EEGNet (windowed only)
-# =====================================================================================
 
 def EEGNet(nb_classes=2, Chans=8, Samples=256,
            dropout_rate=0.5, kern_len=64, F1=8, D=2, F2=16, l2_reg=0.0):
-    """
-    Build the EEGNet architecture (Lawhern et al.) for binary classification on fixed-length windowed EEG.
-
-    Standard EEGNet structure: a temporal Conv2D (kern_len taps) to learn frequency filters, a depthwise Conv2D 
-    across all channels (Chans) to learn spatial filters per temporal filter, then a separable Conv2D to learn 
-    efficient temporal summaries, with average pooling and dropout between blocks for regularization. 
-    F1/D/F2 control the number of temporal filters, depth multiplier, and pointwise filters respectively.
-    kern_len is set relative to sampling rate at the call site (roughly half a second) so the temporal filters 
-    span a physiologically meaningful window regardless of sfreq.
-    """
     reg_kw = {"kernel_regularizer": l2(l2_reg)} if l2_reg > 0 else {}
     sep_reg_kw = ({"depthwise_regularizer": l2(l2_reg), "pointwise_regularizer": l2(l2_reg)}
                 if l2_reg > 0 else {})
@@ -732,38 +592,21 @@ def EEGNet(nb_classes=2, Chans=8, Samples=256,
 
 
 def zscore_per_trial(X):
-    """
-    Per-channel z-score normalization applied independently within each trial/window of a stacked (n, ch, T) array 
-    (mean/std computed over the time axis only, per channel, per trial).
-    """
+    """For a stacked (n, ch, T) array: per-channel z-score within each trial."""
     m = X.mean(axis=2, keepdims=True)
     s = X.std(axis=2, keepdims=True) + 1e-7
     return (X - m) / s
 
 
 def zscore_single_trial(trial: np.ndarray) -> np.ndarray:
-    """
-    Same normalization as zscore_per_trial, for one ragged (ch, T) array (full_trial mode, where trials can't be stacked 
-    into one batch). Used in full_trial mode, where trials have different lengths and cannot be stacked into one batch
-    for a vectorized z-score.
-    """
+    """Same normalization as zscore_per_trial, for one ragged (ch, T) array
+    (full_trial mode, where trials can't be stacked into one batch)."""
     m = trial.mean(axis=1, keepdims=True)
     s = trial.std(axis=1, keepdims=True) + 1e-7
     return (trial - m) / s
 
 
 def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float):
-    """
-    Train and evaluate EEGNet under leave-one-group-out cross-validation (group = subject or trial, per cfg.cv_level).
-
-    Per fold: z-scores the held-in and held-out data, builds a fresh EEGNet (so no weights leak across folds), applies 
-    balanced class weighting to counter any easy/hard label imbalance, and trains with early stopping on val_loss (where "val" 
-    is the held-out LOSO fold -- see README known limitations regarding restore_best_weights). kern_len is derived from
-    sfreq (~0.5s of taps) rather than hardcoded, so it stays meaningful across different sampling rates.
-
-    Loss curves for all folds are saved via plot_loss_curves. Returns a per-fold results DataFrame (group, n_test, accuracy, 
-    macro_f1) and a pooled confusion matrix across all folds.
-    """
     X = X[..., np.newaxis]
     X = zscore_per_trial(X)
     n_ch, n_t = X.shape[1], X.shape[2]
@@ -775,7 +618,12 @@ def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float):
     histories = {}
     for i, (tr, te) in enumerate(logo.split(X, y, groups), 1):
         test_group = np.unique(groups[te])[0]
-        Xtr, Xte, ytr, yte = X[tr], X[te], y[tr], y[te]
+        Xtr_all, Xte, ytr_all, yte = X[tr], X[te], y[tr], y[te]
+
+        # early stopping uses held-out TRAINING groups, never the test fold
+        fit_idx, val_idx = inner_val_split(groups[tr], ytr_all, cfg)
+        Xtr, ytr = Xtr_all[fit_idx], ytr_all[fit_idx]
+        Xval, yval = Xtr_all[val_idx], ytr_all[val_idx]
 
         tf.keras.utils.set_random_seed(cfg.seed)
 
@@ -799,7 +647,7 @@ def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float):
 
         history = model.fit(
             Xtr, ytr,
-            validation_data=(Xte, yte),
+            validation_data=(Xval, yval),
             epochs=cfg.epochs, batch_size=cfg.batch_size,
             class_weight=class_weight, callbacks=[es], verbose=0,
         )
@@ -828,19 +676,10 @@ def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float):
                           labels=[0, 1])
     return res, cm
 
-# =====================================================================================
-# Baseline (band-power + logistic regression):
-# =====================================================================================
+# Baseline (band-power + logistic regression): works for ragged or
+# stacked X since it just iterates "for trial in X"
 
 def bandpower_features(X, sfreq):
-    """
-    Extract log band-power features for each trial/window as input to the logistic regression baseline.
-
-    For each trial, computes a Welch PSD per channel, then averages power within five standard EEG bands (delta 1-4Hz,
-    theta 4-8Hz, alpha 8-13Hz, beta 13-30Hz, gamma 30-40Hz) and log-transforms it (a small epsilon avoids log(0)). 
-    Features are concatenated across bands and channels into one flat vector per trial. Works on either a stacked
-    array or a ragged list, since it iterates trial-by-trial.
-    """
     from scipy.signal import welch
     bands = [(1, 4), (4, 8), (8, 13), (13, 30), (30, 40)]
     feats = []
@@ -855,14 +694,6 @@ def bandpower_features(X, sfreq):
 
 
 def run_baseline_cv(X, y, groups, sfreq):
-    """
-    Train and evaluate the band-power + logistic regression baseline under leave-one-group-out cross-validation.
-
-    A simple baseline (standardized band-power features -> L2 logistic regression with balanced class weights) 
-    used as a sanity-check floor against which EEGNet and BIOT are compared: if the deep models can't beat this, they aren't 
-    learning anything the hand-crafted features didn't already capture. Returns a per-fold results DataFrame
-    (group, accuracy, macro_f1).
-    """
     feats = bandpower_features(X, sfreq)
     logo = LeaveOneGroupOut()
     rows = []
@@ -880,16 +711,9 @@ def run_baseline_cv(X, y, groups, sfreq):
                                           zero_division=0)})
     return pd.DataFrame(rows)
 
-# =====================================================================================
-# BIOT:
-# =====================================================================================
+# BIOT
 
 def get_chs_info(ch_names):
-    """
-    Build the per-channel metadata (name, kind, 3D scalp position) that InterpolatedBIOT needs to spatially 
-    interpolate our montage onto its canonical channel layout. Positions come from MNE's standard 10-20
-    montage, keyed by the electrode names in CH_MAP.
-    """
     montage = mne.channels.make_standard_montage("standard_1020")
     positions = montage.get_positions()["ch_pos"]
     return [
@@ -900,12 +724,10 @@ def get_chs_info(ch_names):
 
 def build_biot_model(chs_info, sfreq, n_times, repo_id):
     """
-    Load InterpolatedBIOT with pretrained weights, spatially adapted to 8-channel montage via interpolation onto 
-    BIOT's canonical (bipolar) layout.
-
-    Falls back to a randomly-initialized InterpolatedBIOT (same architecture, untrained weights) if the pretrained 
-    checkpoint can't be downloaded, e.g. no network access, so a run degrades to from-scratch training rather than 
-    crashing. The fallback is logged.
+    Loads InterpolatedBIOT with pretrained weights, adapted to channel
+    montage via spatial interpolation to BIOT's canonical (bipolar) layout.
+    Falls back to a randomly-initialized InterpolatedBIOT if the checkpoint
+    can't be downloaded.
     """
     try:
         model = InterpolatedBIOT.from_pretrained(
@@ -923,17 +745,7 @@ def build_biot_model(chs_info, sfreq, n_times, repo_id):
 
 
 def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
-    """
-    Fine-tune BIOT under leave-one-group-out cross-validation on fixed-length windowed data (batched training).
-
-    Per fold: optionally z-scores per trial (cfg.biot_normalize), builds a fresh pretrained-or-fallback BIOT model, 
-    applies balanced class weighting via a weighted CrossEntropyLoss, and fine-tunes with AdamW (gradient-clipped) for up 
-    to cfg.biot_epochs, tracking train/val loss each epoch and manually implementing early stopping. GPU is used automatically
-    if available, and cleared between folds to avoid memory accumulation across the LOSO loop.
-
-    Loss curves for all folds are saved via plot_loss_curves. Returns a per-fold results DataFrame (group, n_test, accuracy, 
-    macro_f1) and a pooled confusion matrix.
-    """
+    """Batched BIOT training for uniform-length windowed data."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     norm_note = "z-scored" if cfg.biot_normalize else "raw scale"
     print(f"  [biot] training on device: {device}  (windowed, batched, {norm_note})")
@@ -946,10 +758,15 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
 
     for i, (tr, te) in enumerate(logo.split(X, y, groups), 1):
         test_group = np.unique(groups[te])[0]
-        Xtr, Xte, ytr, yte = X[tr], X[te], y[tr], y[te]
+        Xtr_all, Xte, ytr_all, yte = X[tr], X[te], y[tr], y[te]
         if cfg.biot_normalize:
-            Xtr = zscore_per_trial(Xtr)
+            Xtr_all = zscore_per_trial(Xtr_all)
             Xte = zscore_per_trial(Xte)
+
+        # early stopping uses held-out TRAINING groups, never the test fold
+        fit_idx, val_idx = inner_val_split(groups[tr], ytr_all, cfg)
+        Xtr, ytr = Xtr_all[fit_idx], ytr_all[fit_idx]
+        Xval, yval = Xtr_all[val_idx], ytr_all[val_idx]
 
         torch.manual_seed(cfg.seed)
         model = build_biot_model(chs_info, sfreq, n_times, cfg.biot_repo_id).to(device)
@@ -966,8 +783,13 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
             torch.tensor(ytr, dtype=torch.long),
         )
         train_loader = DataLoader(train_ds, batch_size=cfg.biot_batch_size, shuffle=True)
-        Xte_t = torch.tensor(Xte, dtype=torch.float32).to(device)
-        yte_t = torch.tensor(yte, dtype=torch.long).to(device)
+        val_loader = DataLoader(
+            TensorDataset(torch.tensor(Xval, dtype=torch.float32),
+                          torch.tensor(yval, dtype=torch.long)),
+            batch_size=cfg.biot_batch_size * 4, shuffle=False)
+        test_loader = DataLoader(
+            TensorDataset(torch.tensor(Xte, dtype=torch.float32)),
+            batch_size=cfg.biot_batch_size * 4, shuffle=False)
 
         best_val_loss = float("inf")
         best_state = None
@@ -989,9 +811,13 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
             train_loss_curve.append(float(np.mean(batch_losses)))
 
             model.eval()
+            val_sum, val_n = 0.0, 0
             with torch.no_grad():
-                val_out = model(Xte_t)
-                val_loss = loss_fn(val_out, yte_t).item()
+                for xb, yb in val_loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    val_sum += loss_fn(model(xb), yb).item() * len(yb)
+                    val_n += len(yb)
+            val_loss = val_sum / max(val_n, 1)
             val_loss_curve.append(val_loss)
 
             if val_loss < best_val_loss:
@@ -1009,8 +835,11 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
             model.load_state_dict(best_state)
 
         model.eval()
+        preds = []
         with torch.no_grad():
-            pred = model(Xte_t).argmax(dim=1).cpu().numpy()
+            for (xb,) in test_loader:
+                preds.append(model(xb.to(device)).argmax(dim=1).cpu().numpy())
+        pred = np.concatenate(preds)
 
         acc = accuracy_score(yte, pred)
         f1 = f1_score(yte, pred, average="macro", zero_division=0)
@@ -1035,18 +864,10 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
 
 def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info):
     """
-    Fine-tune BIOT under leave-one-group-out cross-validation on variable-length full-trial data, one trial at 
-    a time (effective batch size 1) since ragged trial lengths can't be stacked into a batched tensor.
-
-    Mirrors run_biot_cv_windowed's training logic (per-trial normalization, balanced class weighting, AdamW with 
-    gradient clipping, manual early stopping on val_loss with in-memory best-state checkpointing) but loops
-    over individual trials both in training and validation, applying the per-sample class weight manually rather than 
-    via the loss function's built-in weight argument. representative_n_times (the median trial length) is used only to 
-    size the model at construction; actual forward passes use each trial's true length. Slower per epoch than the windowed
-    path due to the lack of batching.
-
-    Loss curves for all folds are saved via plot_loss_curves. Returns a per-fold results DataFrame (group, n_test, accuracy, 
-    macro_f1) and a pooled confusion matrix.
+    X is a ragged list of (n_ch, variable_T) float32 arrays -- trials are NOT
+    stacked into one batched tensor, since lengths differ. Trains one trial
+    at a time (effective batch size 1); slower per epoch than the windowed
+    version.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     norm_note = "z-scored" if cfg.biot_normalize else "raw scale"
@@ -1064,14 +885,21 @@ def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info):
 
     for i, (tr, te) in enumerate(logo.split(idx_all, y, groups), 1):
         test_group = np.unique(groups[te])[0]
-        Xtr = [X[j] for j in tr]
-        ytr = y[tr]
+        Xtr_all = [X[j] for j in tr]
+        ytr_all = y[tr]
         Xte = [X[j] for j in te]
         yte = y[te]
         if cfg.biot_normalize:
             # normalize once per fold, not per-epoch
-            Xtr = [zscore_single_trial(x) for x in Xtr]
+            Xtr_all = [zscore_single_trial(x) for x in Xtr_all]
             Xte = [zscore_single_trial(x) for x in Xte]
+
+        # early stopping uses held-out TRAINING groups, never the test fold
+        fit_idx, val_idx = inner_val_split(groups[tr], ytr_all, cfg)
+        Xtr = [Xtr_all[j] for j in fit_idx]
+        ytr = ytr_all[fit_idx]
+        Xval = [Xtr_all[j] for j in val_idx]
+        yval = ytr_all[val_idx]
 
         torch.manual_seed(cfg.seed)
         model = build_biot_model(chs_info, sfreq, representative_n_times, cfg.biot_repo_id).to(device)
@@ -1110,9 +938,9 @@ def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info):
             model.eval()
             val_losses = []
             with torch.no_grad():
-                for j in range(len(Xte)):
-                    xb = torch.tensor(Xte[j], dtype=torch.float32).unsqueeze(0).to(device)
-                    yb = torch.tensor([yte[j]], dtype=torch.long).to(device)
+                for j in range(len(Xval)):
+                    xb = torch.tensor(Xval[j], dtype=torch.float32).unsqueeze(0).to(device)
+                    yb = torch.tensor([yval[j]], dtype=torch.long).to(device)
                     out = model(xb)
                     val_losses.append(loss_fn(out, yb).item())
             val_loss = float(np.mean(val_losses))
@@ -1161,21 +989,10 @@ def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info):
                           labels=[0, 1])
     return res, cm
 
-# =====================================================================================
 # Outputs
-# =====================================================================================
 
 def save_outputs(cfg: Config, base_res, base_cm=None,
                   eeg_res=None, eeg_cm=None, biot_res=None, biot_cm=None):
-    """
-    Persist all per-run results to disk: per-fold accuracy CSVs for whichever models actually ran, a grouped 
-    bar chart comparing per-group accuracy across baseline/EEGNet/BIOT (with a chance-level reference line), and 
-    confusion matrix heatmaps for any model that produced one.
-
-    Output filenames are tagged with '<data_mode>_<cv_level>' so results from different config runs don't overwrite each other. 
-    The bar chart dynamically includes only the panels for models that were actually run (baseline always runs; EEGNet/BIOT are 
-    conditional on cfg.run_eegnet/cfg.run_biot).
-    """
     out_dir = resolve_out_dir(cfg)
     os.makedirs(out_dir, exist_ok=True)
     tag = f"{cfg.data_mode}_{cfg.cv_level}"
@@ -1186,7 +1003,7 @@ def save_outputs(cfg: Config, base_res, base_cm=None,
     if biot_res is not None:
         biot_res.to_csv(os.path.join(out_dir, f"biot_{tag}_accuracy.csv"), index=False)
 
-    # per-group accuracy bar chart
+    # per-group accuracy bar chart -- include whichever models actually ran
     panels = [("Baseline", base_res, "#8172B2")]
     if eeg_res is not None:
         panels.append(("EEGNet", eeg_res, "#4C72B0"))
@@ -1240,25 +1057,9 @@ def save_outputs(cfg: Config, base_res, base_cm=None,
 
     print(f"\nSaved CSVs + plots to ./{out_dir}/")
 
-# =====================================================================================
 # Main
-# =====================================================================================
 
 def main(cfg: Config = None):
-    """
-    Run the full pipeline end-to-end for one Config: label pre-run check, dataset construction, model 
-    training/evaluation, and output saving.
-
-    Branches on cfg.data_mode:
-    - 'windowed': loads the dataset twice at two different sampling rates -- once at cfg.target_sfreq for 
-    EEGNet/baseline, once at cfg.biot_sfreq for BIOT, since each model expects its own native rate. Runs EEGNet 
-    (if enabled), the band-power baseline, and BIOT (if enabled) in turn, then prints a summary and saves all outputs.
-    - 'full_trial': loads the dataset once at cfg.biot_sfreq (EEGNet is force-disabled here since it requires fixed-length 
-    input). Runs BIOT (full-trial, batch-size-1 variant) and the band-power baseline, then summarizes and saves.
-
-    cfg.smoke, if set, restricts every loaded dataset to the first 3 subjects (after full discovery/labeling) for checking pipeline
-    functionality after changes without committing to a full run.
-    """
     cfg = CFG if cfg is None else cfg
     np.random.seed(cfg.seed)
     tf.keras.utils.set_random_seed(cfg.seed)
@@ -1395,4 +1196,4 @@ if __name__ == "__main__":
     #   main(Config(data_mode="windowed", cv_level="trial"))
     #   main(Config(data_mode="full_trial", cv_level="subject"))
     #   main(Config(data_mode="full_trial", cv_level="trial"))
-    main(Config(data_mode="windowed", cv_level="trial"))
+    main(Config(data_mode="windowed", cv_level="subject"))
