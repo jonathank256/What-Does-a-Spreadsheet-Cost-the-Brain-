@@ -1,5 +1,0 @@
-participant_id,trial_num,round_num,trial_in_round,task_type,difficulty,response_type,target_num,target_row,target_col,target_value,target_color,response_row,response_col,response_value,response_color,correct,rt_s,submitted_answer,correct_answer,trigger_code
-test_participant,1,1,1,computation,hard,submission,1,A-B-C,B,77,,,,,,0,7.4282,67,77,
-test_participant,1,1,1,computation,hard,submission,1,A-B-C,B,77,,,,,,1,11.6516,77,77,
-test_participant,1,1,1,computation,hard,submission,2,N-O-P,G,90,,,,,,1,19.9045,90,90,
-test_participant,1,1,1,computation,hard,submission,3,E-F-G,A,179,,,,,,1,27.673,179,179,
