@@ -12,7 +12,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg") # non-interactive backend, just save figures to disk
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import mne
@@ -27,12 +27,13 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.constraints import max_norm
 from tensorflow.keras.regularizers import l2
 
-from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.model_selection import LeaveOneGroupOut, GroupShuffleSplit
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import confusion_matrix, accuracy_score, f1_score
+from sklearn.metrics import (confusion_matrix, accuracy_score, f1_score,
+                             balanced_accuracy_score)
 
 import torch
 import torch.nn as nn
@@ -42,101 +43,132 @@ from braindecode.models import InterpolatedBIOT
 mne.set_log_level("WARNING")
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# raw EEG CSVs in the test dataset label channels generically (C1-C8) based on
-# the amplifier's physical input order, not electrode scalp position. This
-# re-maps each input channel to the actual 10-20 system electrode name
-# so MNE can use standard montage-based processing (filtering, ICA)
+
 CH_MAP = {
     "C1": "Fp1", "C2": "Fp2", "C3": "Fz", "C4": "Cz",
     "C5": "PO7", "C6": "O1", "C7": "O2", "C8": "PO8",
 }
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EEG_COLS = list(CH_MAP.keys())
 
 
 @dataclass
 class Config:
-    """
-    All tunable parameters for the EEG pipeline.
-
-    Two independent axes control what the pipeline does:
-    - data_mode: 'windowed' (fixed-length sliding windows, required for EEGNet),
-    vs. 'full_trial' (variable length per-paragraph segments, BIOT only)
-    - cv_level: 'subject (LOSO)' vs. 'trial', (LOTO for diagnostic purposes, inflates
-    scores due to leakage as subjects other trials are trained)
-    """
     data_root: str = r"Experiment Anonymised Version"
     labels_csv: str = r"Experiment Anonymised Version\Users 001-025.csv"
-    fk_threshold: float | None = None # None: derive from median FK split (see load_fk_labels)
+    fk_threshold: float | None = None
     excluded_subjects: tuple = ("User021",)  # bad electrode session: every recording amp-rejected
 
     data_mode: Literal["windowed", "full_trial"] = "windowed"
     cv_level: Literal["subject", "trial"] = "subject"
 
-    l_freq: float = 1.0 # high-pass cutoff, Hz
-    h_freq: float = 40.0 # low-pass cutoff, Hz
-    notch: float = 60.0 # mains-hum notch filter, Hz
+    l_freq: float = 1.0
+    h_freq: float = 40.0
+    notch: float = 60.0
 
     use_ica: bool = True
     ica_components: int = 6
-    reject_uv: float = 750.0 # amplitude-based artifact rejection threshold, microvolts
-    ica_min_sfreq: float = 30.0 # ICA skipped below this SR as unreliable
+    reject_uv: float = 750.0
+    ica_min_sfreq: float = 30.0
     ica_max_iter: int = 500
     ica_tol: float = 1e-3
 
     # windowed-mode only
-    target_sfreq: float = 128.0 # resample rate for EEGNet path      
-    window_s: float = 2.0 # window length, seconds
-    window_overlap: float = 0.25 # fractional overlap between consecutive windows
+    target_sfreq: float = 128.0      
+    window_s: float = 2.0
+    window_overlap: float = 0.25
 
     # full_trial-mode only
-    min_trial_s: float = 2.0 # trials shorter than this are dropped (s)          
+    min_trial_s: float = 2.0          
 
     run_eegnet: bool = True # auto-disabled if data_mode == "full_trial"
     run_biot: bool = True
+    # difficulty-vs-time control on the baseline model (windowed, subject-level CV only)
+    run_time_control: bool = True
+    # z-score band-power features within each subject before the baseline and the
+    # time control. Uses the test subject's unlabeled data.
+    baseline_subject_norm: bool = False
+    # centre band-power features within each recording (one document) before the
+    # baseline. Removes anything constant over a document: the person, session drift,
+    # electrode contact. Only differences between paragraphs of one document remain,
+    # so it is meant for label_source="effort".
+    baseline_recording_norm: bool = False
 
-    biot_repo_id: str = "braindecode/biot-pretrained-six-datasets-18chs"
+    # what the models predict:
+    #       "readability" = Flesch-Kincaid median split, one label per document (default)
+    #        "effort" = each paragraph's self-rated Effort (annotations.json), split
+    #                   per participant at the value that balances their two classes
+    label_source: Literal["readability", "effort"] = "readability"
+    # some paragraph time ranges overlap; cut each stretch of EEG only once
+    drop_duplicate_windows: bool = True
+
+    # how EEGNet and BIOT inputs are scaled:
+    #       "window" = each window z-scored on its own (default). Every window ends up
+    #                  the same size, so differences in signal strength between windows
+    #                  are erased; only shape and frequency mix remain.
+    #       "subject" = one mean and std per channel per subject, over all that subject's
+    #                   windows. Puts every subject on a common scale while keeping differences
+    #                   between windows. Uses the test subject's unlabeled data.
+    deep_norm: Literal["window", "subject"] = "window"
+
+    biot_repo_id: str = r"biot_pretrained"
     biot_sfreq: float = 200.0 # BIOT's pretrained checkpoints are native to 200Hz
     biot_epochs: int = 15
     biot_batch_size: int = 16 # windowed mode only; full_trial is always batch size 1
     biot_lr: float = 3e-5
     biot_patience: int = 5
-    # per-trial z-score before feeding BIOT. 
-    # signal sits at ~1e-5 to 1e-4 volt scale, but BIOT's
-    # pretraining pipeline treats normalization as a
-    # required preprocessing step.
+    # z-score inputs before BIOT: the raw signal is on a ~1e-5 to 1e-4 V scale,
+    # and BIOT's pretraining assumes normalized input.
     biot_normalize: bool = True       
 
-    epochs: int = 200 # EEGNet max epochs
+    epochs: int = 200 # EEGNet
     batch_size: int = 32 # EEGNet
     lr: float = 5e-4 # EEGNet
     dropout_rate: float = 0.5
     patience: int = 8 # EEGNet early stopping
     l2_reg: float = 1e-4
     seed: int = 42
-    smoke: bool = False # if True, restrict to first 3 subjects for fast pipeline test
+    smoke: bool = False
+
+    # share of the training groups (subjects or trials) held out inside each fold
+    # for early stopping / best-weight selection. The test fold is never used for this.
+    val_fraction: float = 0.15
 
     out_dir_base: str = "results"
 
+    # which recordings to load:
+    # "vixi" = the reading-study CSVs under data_root (default)
+    # "physionet" = PhysioNet EEGMMIDB baseline runs, eyes open vs eyes closed.
+    dataset: Literal["vixi", "physionet"] = "vixi"
+    physionet_subjects: tuple = tuple(range(1, 110))
+    # 88, 92 and 100 were recorded at a different sampling rate with shorter runs,
+    # and 104 has faulty recordings
+    physionet_excluded: tuple = (88, 92, 100, 104)
+    physionet_path: str | None = os.path.join(SCRIPT_DIR, "physionet_data")
 
 CFG = Config()
 
 
 def resolve_out_dir(cfg: Config) -> str:
-    """
-    Build the results directory name from current data_mode/cv_level
-    to prevent separate runs from overwriting past results. 
-    """
-    return f"{cfg.out_dir_base}_{cfg.data_mode}_{cfg.cv_level}"
+    # one folder per variant, so a smoke run or a normalized run never
+    # overwrites the files from a full, unnormalized run
+    out = f"{cfg.out_dir_base}_{cfg.data_mode}_{cfg.cv_level}"
+    if cfg.dataset != "vixi":
+        out += f"_{cfg.dataset}"
+    if cfg.label_source != "readability":
+        out += f"_{cfg.label_source}"
+    if cfg.deep_norm != "window":
+        out += "_deepsubjnorm"
+    if cfg.baseline_recording_norm:
+        out += "_recnorm"
+    if cfg.baseline_subject_norm:
+        out += "_subjnorm"
+    if cfg.smoke:
+        out += "_smoke"
+    return out
 
 
 def plot_loss_curves(histories: dict, model_name: str, cfg: Config):
-    """
-    Plot per-fold train/val loss curves (one line per LOSO fold coloured by fold
-    order) side by side, save to <out_dir>/loss_curves/.
-
-    histories: dictr mapping fold's held-out group name: {"traim": [...], "val": [...]}
-    model_name: used in the title and output filename (e.g. "EEGNet", "BIOT (windowed)")
-    """
     out_dir = resolve_out_dir(cfg)
     loss_dir = os.path.join(out_dir, "loss_curves")
     os.makedirs(loss_dir, exist_ok=True)
@@ -172,25 +204,9 @@ def plot_loss_curves(histories: dict, model_name: str, cfg: Config):
     plt.close(fig)
     print(f"  [plot] saved {model_name} loss curves -> {fname}")
 
-# =====================================================================================
 # Labels
-# =====================================================================================
 
 def load_fk_labels(csv_path, threshold=None):
-    """
-    Builds a binary difficulty label for each (participant, document) pair
-    from Flesch-Kincaid readability score (dataset specific).
-
-    Source CSV has one row per participant-document-question combo, so
-    FK score is duplicated across rows for same document; takes the first
-    occurence per document. If no threshold given, one is derived from median
-    FK score across documents (median split -> roughly balanced easy/hard classes)
-
-    Returns:
-        fk_lookup: dict mapping (pid, doc_id) -> 0 (easy) or 1 (hard)
-        doc_fk_scores: dict mapping doc_id -> raw FK score
-        threshold: FK score used as the easy/hard cutoff
-    """
     df = pd.read_csv(csv_path, header=0)
     df = df.dropna(subset=[df.columns[0]])
 
@@ -214,10 +230,6 @@ def load_fk_labels(csv_path, threshold=None):
 
 
 def extract_participant_id(user_id):
-    """
-    Normalize a raw folder-derived user id to zero-padded canonical form ('User7' -> 'User007')
-    for join key against labels CSV.
-    """
     m = re.match(r"User0*(\d+)", user_id)
     if not m:
         return user_id
@@ -225,15 +237,6 @@ def extract_participant_id(user_id):
 
 
 def extract_document_id(test_name, known_doc_ids):
-    """
-    Identify which document a test folder corresponds to. 
-
-    Tries an exact substring match against known_Doc_ids first, falls back
-    to a regex match on '<3 letters>_<2 digits>' document-code pattern
-    for cares where known_doc_ids isn't populated yet.
-
-    Currently always called with known_doc_ids=[] so always regex match. 
-    """
     for doc in known_doc_ids:
         if doc in test_name:
             return doc
@@ -242,10 +245,6 @@ def extract_document_id(test_name, known_doc_ids):
 
 
 def resolve_label_key(user_id, test_name, fk_lookup, doc_fk_scores):
-    """
-    Resolve a (participant, document) key for subject/test pair
-    and return only if a label exists for it in fk_lookup, otherwise None.
-    """
     pid = extract_participant_id(user_id)
     doc = extract_document_id(test_name, doc_fk_scores.keys())
     key = (pid, doc)
@@ -253,12 +252,6 @@ def resolve_label_key(user_id, test_name, fk_lookup, doc_fk_scores):
 
 
 def check_fk_distribution(subjects, fk_lookup, doc_fk_scores, threshold):
-    """
-    Sanity check: prints easy/hard label for every document, then reports
-    how many discovered subject/test recordings successfully resolve to a label
-    vs. how many are missing one, and why, plus overall class balance. Runs before
-    main pipeline so labeling problems are immediately apparent. 
-    """
     print(f"FK threshold (median split): {threshold:.2f}")
     for doc, fk in sorted(doc_fk_scores.items(), key=lambda x: x[1]):
         label = "hard" if fk > threshold else "easy"
@@ -279,26 +272,10 @@ def check_fk_distribution(subjects, fk_lookup, doc_fk_scores, threshold):
     print(s.value_counts().sort_index())
     return s
 
-# =====================================================================================
+
 # Subject/trial discovery, two-pass duplicate-recording dedup
-# =====================================================================================
 
 def find_subjects(cfg: Config):
-    """
-    Discover all usable (subject, test) recordings under data_root, resolving duplicates.
-
-    Runs two dedup passes:
-    - Pass A: within one recording folder, if multiple *_EEG_rawEEGData.csv files exist in
-    the same rec_dir (restarted session e.g.), keep the largest file.
-    - Pass B: across separate folder trees for same (participant, document) pair: if the same
-    participant appears to have recorded the same document more than once, keep largest.
-
-    Every dedup decision is printed as an [audit] line for traceable discovery.
-
-    Returns:
-        list of (user_id, test_name, eeg_csv_path, annotations_json_path) tuples, one per retained
-        recording.
-    """
     pattern = os.path.join(cfg.data_root, "User*")
     all_entries = []  # (user_id, test_dir, rec_dir, kept_eeg_csv, kept_size, ann_path)
 
@@ -315,7 +292,7 @@ def find_subjects(cfg: Config):
             print(f"  [skip] {user_id}: no EEG csv found")
             continue
 
-        # Pass A: check EEG csvs in same folder tree (same rec_dir): keep largest, drop smaller duplicates
+        # Pass A: check EEG csvs in same folder tree (same rec_dir) -- keep largest, drop smaller duplicates
         by_rec_dir = {}
         for eeg_csv in eeg_csvs:
             rec_dir = os.path.dirname(eeg_csv)
@@ -340,7 +317,7 @@ def find_subjects(cfg: Config):
                 continue
             all_entries.append((user_id, test_dir, rec_dir, kept, os.path.getsize(kept), ann_path))
 
-    # Pass B: multiple separated folder trees for the same (participant, document) 
+    # Pass B: if one (participant, document) pair has several separate folder trees, keep the largest
     by_key = {}
     for entry in all_entries:
         user_id, test_dir, rec_dir, kept, size, ann_path = entry
@@ -371,11 +348,63 @@ def find_subjects(cfg: Config):
     return subj
 
 
+# Session order
+#
+# Every participant read the documents as easy, hard, easy, hard in blocks of
+# four (which half of the document set came first was counterbalanced, the
+# difficulty order was not). So "hard" is also "later in the session", and a
+# model can score above chance by picking up session drift alone. The functions
+# below recover each recording's block so that can be tested.
+
+def recording_timestamp(eeg_csv):
+    """Unix timestamp embedded in a recording's file name (..._U1567157659_EEG_...)."""
+    m = re.search(r"_U(\d+)_EEG", os.path.basename(eeg_csv))
+    return int(m.group(1)) if m else None
+
+
+def session_blocks(subjects, fk_lookup, doc_fk_scores):
+    """
+    Maps each recording ("user_id::test_name", the same string build_dataset
+    uses for trial_groups) to its block in that participant's session.
+
+    Recordings are sorted by time within each participant, and a new block
+    starts whenever the label changes. The expected pattern is four blocks:
+    easy, hard, easy, hard -> blocks 0, 1, 2, 3. A participant with any other
+    pattern is reported and given block -1, which the control leaves out.
+    """
+    by_pid = {}
+    for user_id, test_name, eeg_csv, _ in subjects:
+        key = resolve_label_key(user_id, test_name, fk_lookup, doc_fk_scores)
+        ts = recording_timestamp(eeg_csv)
+        if key is None or ts is None:
+            print(f"  [order] [warn] {user_id}/{test_name}: no label or no timestamp, left out")
+            continue
+        pid = extract_participant_id(user_id)
+        by_pid.setdefault(pid, []).append((ts, f"{user_id}::{test_name}", fk_lookup[key]))
+
+    block_of = {}
+    n_ok = 0
+    for pid, recs in sorted(by_pid.items()):
+        recs.sort()
+        block, prev, pattern = -1, None, []
+        for _, trial_id, label in recs:
+            if label != prev:
+                block += 1
+                pattern.append(label)
+                prev = label
+            block_of[trial_id] = block
+        if pattern != [0, 1, 0, 1]:
+            print(f"  [order] [warn] {pid}: label blocks in time order are {pattern}, "
+                  f"expected [0, 1, 0, 1]; left out of the time control")
+            for _, trial_id, _ in recs:
+                block_of[trial_id] = -1
+        else:
+            n_ok += 1
+    print(f"  [order] {n_ok} of {len(by_pid)} participants follow easy, hard, easy, hard")
+    return block_of
+
+
 def estimate_sfreq(ts: np.ndarray) -> float:
-    """
-    Estimate the true sampling rate from raw timestamps (ms) rather than trusting nominal
-    device spec, due to potential dropped samples or drift. Computed as (n_samples - 1) / total_duration.
-    """
     duration_ms = ts[-1] - ts[0]
     n_intervals = len(ts) - 1
     if duration_ms <= 0 or n_intervals <= 0:
@@ -384,14 +413,6 @@ def estimate_sfreq(ts: np.ndarray) -> float:
 
 
 def remove_blinks_ica(raw, cfg: Config):
-    """
-    Remove eye-blink artifacts via ICA.
-
-    Fits ICA on a 1Hz-high-passed copy of the data (ICA is sensitive to slow drifts, so a stricter high-pass
-    than the main pipeline filter is used just for fitting; the resulting unmixing is then applied to the original,
-    non-refiltered 'raw'). Blink components identified via correlating each component against frontal channels Fp1 and
-    Fp2 (nearest electrodes to eyes) via MNE's find_bads_eog, then excluded before signal reconstruction.
-    """
     ica = mne.preprocessing.ICA(
         n_components=cfg.ica_components,
         method="fastica",
@@ -413,98 +434,87 @@ def remove_blinks_ica(raw, cfg: Config):
     ica.apply(raw, verbose=False)
     return raw
 
+def _clean_raw(raw, cfg: Config, target_sfreq: float, name: str):
+    """Resample, band-pass, notch and ICA.
+    `raw` must already be in volts with a montage set. Returns (sig, sfreq),
+    or (None, None) if the recording cannot be filtered."""
+    sfreq = raw.info["sfreq"]
+    if sfreq != target_sfreq:
+        raw.resample(target_sfreq, verbose=False)
+        sfreq = target_sfreq
+ 
+    nyquist = sfreq / 2.0
+    if nyquist <= cfg.l_freq + 1:
+        print(f"  [skip] {name}: sfreq={sfreq:.1f}Hz too low to filter at all")
+        return None, None
+ 
+    h_freq_eff = min(cfg.h_freq, nyquist * 0.95)
+    if h_freq_eff < cfg.h_freq:
+        print(f"  [warn] {name}: sfreq={sfreq:.1f}Hz, clamping h_freq {cfg.h_freq}->{h_freq_eff:.1f}")
+ 
+    raw.filter(cfg.l_freq, h_freq_eff, fir_design="firwin", verbose=False)
+ 
+    if cfg.notch and cfg.notch < nyquist * 0.95:
+        raw.notch_filter(cfg.notch, verbose=False)
+    elif cfg.notch:
+        print(f"  [warn] {name}: sfreq={sfreq:.1f}Hz too low for {cfg.notch}Hz notch, skipping")
+ 
+    if cfg.use_ica and sfreq >= cfg.ica_min_sfreq:
+        raw = remove_blinks_ica(raw, cfg)
+    elif cfg.use_ica:
+        print(f"  [warn] {name}: sfreq={sfreq:.1f}Hz too low for ICA, skipping blink removal")
+ 
+    return raw.get_data(picks="eeg"), sfreq
 
 def _preprocess_raw(eeg_csv: str, cfg: Config, target_sfreq: float):
-    """
-    Load one raw EEG CSV and run the full preprocessing chain: build an MNE Raw object, resample
-    to target sfreq, band-pass and notch filter, and optionally remove blinks with ICA.
-
-    When a recording's estimated SR is unsually low, several steps degrade gracefully rather than a
-    hard-fail:
-    - filtering is skipped entirely if sfreq is too low to support even low end of the bandpass (l_freq)
-    - h_freq is clamped down toward Nyquist limit if needed
-    - the notch filter is skipped if sfreq is too low to support it
-    - ICA is skipped if sfreq is below cfg.ica_min_sfreq
-    These skips are all logged.
-
-    Returns:
-        (signal, timestamps, sfreq) as (n_ch, n_samples) array, raw ms timestamps, and the final (possibly resampled)
-        SR, or (None, None, None) if file is unusable due to missing columns, too few samples, very low sfreq.
-    """
     eeg = pd.read_csv(eeg_csv)
     eeg.columns = [c.strip() for c in eeg.columns]
-
+ 
     missing = [c for c in EEG_COLS + ["Timestamp"] if c not in eeg.columns]
     if missing:
         print(f"  [skip] {eeg_csv}: missing columns {missing}")
         return None, None, None
-
+ 
     data = eeg[EEG_COLS].values.T
     ts = eeg["Timestamp"].values
-
+ 
     if len(ts) < 2:
         return None, None, None
     sfreq = estimate_sfreq(ts)
     if not np.isfinite(sfreq) or sfreq <= 0:
         print(f"  [skip] {eeg_csv}: invalid sfreq estimate")
         return None, None, None
-
+ 
     ch_names = [CH_MAP[c] for c in EEG_COLS]
     info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
     raw = mne.io.RawArray(data * 1e-6, info, verbose=False)
     raw.set_montage("standard_1020", match_case=False, on_missing="warn")
-
-    if sfreq != target_sfreq:
-        raw.resample(target_sfreq, verbose=False)
-        sfreq = target_sfreq
-
-    nyquist = sfreq / 2.0
-    if nyquist <= cfg.l_freq + 1:
-        print(f"  [skip] {eeg_csv}: sfreq={sfreq:.1f}Hz too low to filter at all")
+ 
+    sig, sfreq = _clean_raw(raw, cfg, target_sfreq, eeg_csv)
+    if sig is None:
         return None, None, None
-
-    h_freq_eff = min(cfg.h_freq, nyquist * 0.95)
-    if h_freq_eff < cfg.h_freq:
-        print(f"  [warn] {eeg_csv}: sfreq={sfreq:.1f}Hz, clamping h_freq {cfg.h_freq}->{h_freq_eff:.1f}")
-
-    raw.filter(cfg.l_freq, h_freq_eff, fir_design="firwin", verbose=False)
-
-    if cfg.notch and cfg.notch < nyquist * 0.95:
-        raw.notch_filter(cfg.notch, verbose=False)
-    elif cfg.notch:
-        print(f"  [warn] {eeg_csv}: sfreq={sfreq:.1f}Hz too low for {cfg.notch}Hz notch, skipping")
-
-    if cfg.use_ica and sfreq >= cfg.ica_min_sfreq:
-        raw = remove_blinks_ica(raw, cfg)
-    elif cfg.use_ica:
-        print(f"  [warn] {eeg_csv}: sfreq={sfreq:.1f}Hz too low for ICA, skipping blink removal")
-
-    sig = raw.get_data(picks="eeg")
     return sig, ts, sfreq
 
 
-def load_subject(eeg_csv: str, ann_path: str, cfg: Config, doc_label: int, target_sfreq: float):
-    """
-    Preprocess one recording and segment it into model-ready trials/windows, aligned to the paragraph timing in 
-    annotations.json.
+def paragraph_label(p, cfg: Config, doc_label: int, effort_cut):
+    """Label for one paragraph: the document's readability label, or (when
+    label_source is "effort") whether the paragraph's own Effort rating is above
+    the participant's cut. None means the paragraph cannot be labelled."""
+    if cfg.label_source != "effort":
+        return doc_label
+    effort = p.get("Effort")
+    if effort_cut is None or not isinstance(effort, (int, float)):
+        return None
+    return int(effort > effort_cut)
 
-    Paragraph on/off times in annotations.json are relative to the first valid paragraph's start (t0), not the 
-    recording's absolute start, so all timestamps are converted to sample offsets relative to t0 before slicing.
 
-    Behavior depends on cfg.data_mode:
-    - 'windowed': each paragraph's time range is cut into fixed-length, overlapping windows (cfg.window_s, 
-    cfg.window_overlap). Paragraphs shorter than one window are dropped entirely; any window containing
-    a sample exceeding cfg.reject_uv is rejected as an artifact.
-    - 'full_trial': each paragraph becomes one variable-length trial (no windowing). Paragraphs shorter than 
-    cfg.min_trial_s are dropped; the same amplitude-based rejection applies to the whole trial.
-
-    Every window/trial in a given recording inherits the same doc_label, since document difficulty, not paragraph, 
-    is the label of interest.
-
-    Returns:
-        (Xs, ys, sfreq): Xs is a list of (n_ch, T) float32 arrays (T fixed in windowed mode, variable in full_trial mode); 
-        ys is doc_label repeated len(Xs) times. Returns (None, None, None) if preprocessing fails or no usable windows/trials 
-        survive.
+def load_subject(eeg_csv: str, ann_path: str, cfg: Config, doc_label: int, target_sfreq: float,
+                 effort_cut=None):
+    """Returns (Xs, ys, sfreq):
+      windowed   -> Xs: list of (n_ch, win_n) arrays, one per window
+      full_trial -> Xs: list of (n_ch, variable_T) arrays, one per paragraph
+    ys holds one label per item: the document label for every item when
+    label_source is "readability", the paragraph's own label when it is "effort".
     """
     sig, ts, sfreq = _preprocess_raw(eeg_csv, cfg, target_sfreq)
     if sig is None:
@@ -519,7 +529,8 @@ def load_subject(eeg_csv: str, ann_path: str, cfg: Config, doc_label: int, targe
     t0 = valid_paragraphs[0]["timeRangeStart"] if valid_paragraphs else ts[0]
 
     Xs, ys = [], []
-    n_too_short = n_rejected = 0
+    n_too_short = n_rejected = n_unlabelled = n_duplicate = 0
+    seen_starts = set()
 
     if cfg.data_mode == "windowed":
         win_n = int(round(cfg.window_s * sfreq))
@@ -535,8 +546,17 @@ def load_subject(eeg_csv: str, ann_path: str, cfg: Config, doc_label: int, targe
             if end - start < win_n:
                 n_too_short += 1
                 continue
+            label = paragraph_label(p, cfg, doc_label, effort_cut)
+            if label is None:
+                n_unlabelled += 1
+                continue
 
             for w0 in range(start, end - win_n + 1, step_n):
+                if cfg.drop_duplicate_windows:
+                    if w0 in seen_starts:      # same stretch already cut for an earlier paragraph
+                        n_duplicate += 1
+                        continue
+                    seen_starts.add(w0)
                 window = sig[:, w0:w0 + win_n]
                 if window.shape[1] != win_n:
                     continue
@@ -544,7 +564,7 @@ def load_subject(eeg_csv: str, ann_path: str, cfg: Config, doc_label: int, targe
                     n_rejected += 1
                     continue
                 Xs.append(window.astype(np.float32))
-                ys.append(doc_label)
+                ys.append(label)
 
     else:  # full_trial
         min_n = int(round(cfg.min_trial_s * sfreq))
@@ -558,50 +578,66 @@ def load_subject(eeg_csv: str, ann_path: str, cfg: Config, doc_label: int, targe
             if end - start < min_n:
                 n_too_short += 1
                 continue
+            label = paragraph_label(p, cfg, doc_label, effort_cut)
+            if label is None:
+                n_unlabelled += 1
+                continue
 
             trial = sig[:, start:end]
             if reject_v is not None and np.any(np.abs(trial) > reject_v):
                 n_rejected += 1
                 continue
             Xs.append(trial.astype(np.float32))
-            ys.append(doc_label)
+            ys.append(label)
 
     if not Xs:
         unit = "windows" if cfg.data_mode == "windowed" else "trials"
         print(f"  [skip] {eeg_csv}: no usable {unit} "
-              f"(too_short={n_too_short}, amp_rejected={n_rejected})")
+              f"(too_short={n_too_short}, amp_rejected={n_rejected}, "
+              f"unlabelled={n_unlabelled}, duplicate={n_duplicate})")
         return None, None, None
 
     return Xs, np.array(ys, dtype=int), sfreq
 
-# =====================================================================================
-# Dataset assembly
-# =====================================================================================
+
+# Dataset assembly: returns BOTH subject-level and trial-level group
+# arrays, so cv_level can be chosen at train time without
+# rebuilding the dataset.
+
+def effort_cuts(subjects):
+    """
+    participant -> cut. A paragraph counts as "high effort" when its Effort rating
+    is above that participant's cut. People use the 1-5 scale differently, so the
+    cut is chosen per participant as the value that splits their rated paragraphs
+    most evenly. Uses the ratings only, never the EEG.
+    """
+    ratings = {}
+    for user_id, _, _, ann_path in subjects:
+        try:
+            with open(ann_path) as f:
+                paragraphs = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for p in paragraphs:
+            effort = p.get("Effort") if isinstance(p, dict) else None
+            if isinstance(effort, (int, float)):
+                ratings.setdefault(extract_participant_id(user_id), []).append(effort)
+
+    cuts = {}
+    for pid, vals in sorted(ratings.items()):
+        vals = np.asarray(vals, dtype=float)
+        candidates = sorted(set(vals.tolist()))[:-1]     # cutting at the top value leaves no "high"
+        if not candidates:
+            print(f"  [effort] [warn] {pid}: every paragraph has the same rating; left out")
+            continue
+        cut = min(candidates, key=lambda c: abs((vals > c).mean() - 0.5))
+        cuts[pid] = cut
+        print(f"  [effort] {pid}: high = Effort above {cut:g}   "
+              f"({100 * (vals > cut).mean():.0f}% of {len(vals)} paragraphs)")
+    return cuts
+
 
 def build_dataset(cfg: Config, target_sfreq: float):
-    """
-    Assemble the full dataset across all subjects: discover recordings, resolve FK labels, preprocess and 
-    segment each one, and concatenate into pooled arrays.
-
-    Builds BOTH subject-level and trial-level group arrays (subj_groups, trial_groups) up front regardless of cfg.cv_level, 
-    so the caller can choose leave-one-subject-out vs. leave-one-trial-out at train time (via select_groups) without rebuilding 
-    the dataset for each comparison.
-
-    Recordings with no resolvable FK label, or that produce no usable windows/trials, are skipped and logged. Raises if no 
-    subjects are found on disk, if no recording yields any usable data, or if subjects don't agree on channel count 
-    (montage mismatch).
-
-    Behavior depends on cfg.data_mode:
-    - 'windowed': windows are stacked into one dense (n, ch, T) array. If subjects ended up with slightly different window 
-    lengths (can happen from sfreq-dependent rounding), all windows are cropped to the shortest length found, with a warning.
-    - 'full_trial': trials are kept as a ragged Python list of (ch, T) arrays, since lengths vary per paragraph and can't be 
-    stacked.
-
-    Returns:
-        (X, y, subj_groups, trial_groups, mean_sfreq) -- X is either a stacked ndarray (windowed) or a list of arrays (full_trial);
-        y, subj_groups, trial_groups are 1D arrays aligned to X; mean_sfreq is the average estimated sampling rate across all 
-        source recordings (used downstream for BIOT model construction and band-power feature extraction).
-    """
     subjects = find_subjects(cfg)
     if not subjects:
         raise FileNotFoundError(
@@ -613,6 +649,7 @@ def build_dataset(cfg: Config, target_sfreq: float):
     print(f"Found {len(subjects)} subject/test files.")
     print(f"Loaded FK labels for {len(doc_fk_scores)} documents "
           f"(threshold={threshold:.2f}) from {cfg.labels_csv}")
+    cuts = effort_cuts(subjects) if cfg.label_source == "effort" else {}
 
     X_parts, y_parts, subj_groups, trial_groups = [], [], [], []
     n_times_seen = set()
@@ -625,8 +662,17 @@ def build_dataset(cfg: Config, target_sfreq: float):
             print(f"  [skip] {user_id}/{test_name}: no FK label in {cfg.labels_csv}")
             continue
         doc_label = fk_lookup[key]
+        label_note = f"label={doc_label}"
+        effort_cut = None
+        if cfg.label_source == "effort":
+            effort_cut = cuts.get(extract_participant_id(user_id))
+            label_note = "effort labels"
+            if effort_cut is None:
+                print(f"  [skip] {user_id}/{test_name}: no usable Effort ratings for this participant")
+                continue
 
-        Xs, ys, sfreq = load_subject(eeg_csv, ann_path, cfg, doc_label, target_sfreq=target_sfreq)
+        Xs, ys, sfreq = load_subject(eeg_csv, ann_path, cfg, doc_label, target_sfreq=target_sfreq,
+                                     effort_cut=effort_cut)
         if Xs is None:
             print(f"  [skip] {user_id}/{test_name}: no usable data")
             continue
@@ -643,12 +689,12 @@ def build_dataset(cfg: Config, target_sfreq: float):
             n_times_seen.add(Xs[0].shape[1])
             print(f"  [ok]   {user_id}/{test_name}: {len(Xs):4d} windows, "
                   f"{Xs[0].shape[0]} ch, {Xs[0].shape[1]} samples, sfreq~{sfreq:.1f}Hz, "
-                  f"label={doc_label}, classes={np.bincount(ys, minlength=2)}")
+                  f"{label_note}, classes={np.bincount(ys, minlength=2)}")
         else:
             durations_s = [x.shape[1] / sfreq for x in Xs]
             print(f"  [ok]   {user_id}/{test_name}: {len(Xs):3d} trials, "
                   f"{Xs[0].shape[0]} ch, durations {min(durations_s):.1f}-{max(durations_s):.1f}s, "
-                  f"sfreq~{sfreq:.1f}Hz, label={doc_label}, classes={np.bincount(ys, minlength=2)}")
+                  f"sfreq~{sfreq:.1f}Hz, {label_note}, classes={np.bincount(ys, minlength=2)}")
 
     if not X_parts:
         raise RuntimeError("No usable data across any subject.")
@@ -680,31 +726,218 @@ def build_dataset(cfg: Config, target_sfreq: float):
           f"({min(lengths)/mean_sfreq:.1f}-{max(lengths)/mean_sfreq:.1f}s)")
     return X_parts, y, subj_groups, trial_groups, mean_sfreq
 
+PHYSIONET_RUN_LABEL = {1: 0, 2: 1}   # run 1 = eyes open -> 0, run 2 = eyes closed -> 1
+ 
+CLASS_NAMES = {
+    "vixi": ("easy", "hard"),
+    "physionet": ("eyes open", "eyes closed"),
+}
+PLOT_TITLE = {
+    "vixi": "Document-difficulty decoding",
+    "physionet": "Eyes open vs closed (PhysioNet)",
+}
+ 
+def _load_physionet_run(edf_path: str, cfg: Config, target_sfreq: float):
+    """One EDF run -> (sig, sfreq) on the same 8 channels as the reading study."""
+    name = os.path.basename(edf_path)
+    raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
+    mne.datasets.eegbci.standardize(raw)        # "Fp1." -> "Fp1", "Po7." -> "PO7", ...
+ 
+    chs = list(CH_MAP.values())
+    missing = [c for c in chs if c not in raw.ch_names]
+    if missing:
+        print(f"  [skip] {name}: missing channels {missing}")
+        return None, None
+    raw.pick(chs)
+    raw.reorder_channels(chs)                   # same channel order as CH_MAP
+    raw.set_montage("standard_1020", match_case=False, on_missing="warn")
+ 
+    # EDF data from MNE is already in volts: no * 1e-6 here
+    return _clean_raw(raw, cfg, target_sfreq, name)
+ 
+ 
+def _physionet_items(sig: np.ndarray, sfreq: float, cfg: Config):
+    """Cut one run the same way load_subject cuts a paragraph.
+    Returns (list of arrays, n_rejected)."""
+    reject_v = cfg.reject_uv * 1e-6 if cfg.reject_uv else None
+ 
+    if cfg.data_mode == "full_trial":            # the whole one-minute run is one trial
+        if reject_v is not None and np.any(np.abs(sig) > reject_v):
+            return [], 1
+        return [sig.astype(np.float32)], 0
+ 
+    win_n = int(round(cfg.window_s * sfreq))
+    step_n = max(1, int(round(cfg.window_s * (1 - cfg.window_overlap) * sfreq)))
+    Xs, n_rejected = [], 0
+    for w0 in range(0, sig.shape[1] - win_n + 1, step_n):
+        window = sig[:, w0:w0 + win_n]
+        if reject_v is not None and np.any(np.abs(window) > reject_v):
+            n_rejected += 1
+            continue
+        Xs.append(window.astype(np.float32))
+    return Xs, n_rejected
+ 
+ 
+def build_physionet_dataset(cfg: Config, target_sfreq: float):
+    """Same return values as build_dataset: X, y, subj_groups, trial_groups, mean_sfreq.
+    subj_groups = "S001", trial_groups = "S001::R01". Each trial is one run, so
+    every trial holds a single class."""
+    subjects = [s for s in cfg.physionet_subjects if s not in cfg.physionet_excluded]
+    print(f"PhysioNet EEGMMIDB: {len(subjects)} subjects, runs {list(PHYSIONET_RUN_LABEL)} "
+          f"(first use downloads a few hundred MB)")
+ 
+    X_parts, y_parts, subj_groups, trial_groups = [], [], [], []
+    n_times_seen, sfreqs_seen = set(), []
+ 
+    for subj in subjects:
+        sid = f"S{subj:03d}"
+    
+        if cfg.physionet_path: # local copy: <path>/S001/S001R01.edf
+            paths = [os.path.join(cfg.physionet_path, sid, f"{sid}R{run:02d}.edf")
+                    for run in PHYSIONET_RUN_LABEL]
+            missing = [p for p in paths if not os.path.exists(p)]
+            if missing:
+                print(f"  [skip] {sid}: not found {missing}")
+                paths = [p for p in paths if os.path.exists(p)]
+        else:
+            try:
+                paths = mne.datasets.eegbci.load_data(subj, list(PHYSIONET_RUN_LABEL),
+                                                update_path=False)
+            except Exception as e:
+                print(f"  [skip] {sid}: download/load failed ({e})")
+                continue
+ 
+        for edf_path in paths:
+            m = re.search(r"R(\d+)\.edf$", os.path.basename(str(edf_path)))
+            run = int(m.group(1)) if m else None
+            if run not in PHYSIONET_RUN_LABEL:
+                print(f"  [skip] {edf_path}: could not read run number")
+                continue
+            label = PHYSIONET_RUN_LABEL[run]
+ 
+            sig, sfreq = _load_physionet_run(str(edf_path), cfg, target_sfreq)
+            if sig is None:
+                continue
+            Xs, n_rejected = _physionet_items(sig, sfreq, cfg)
+            if not Xs:
+                print(f"  [skip] {sid} run {run}: no usable data (amp_rejected={n_rejected})")
+                continue
+ 
+            trial_id = f"{sid}::R{run:02d}"
+            X_parts.extend(Xs)
+            y_parts.extend([label] * len(Xs))
+            subj_groups.extend([sid] * len(Xs))
+            trial_groups.extend([trial_id] * len(Xs))
+            sfreqs_seen.append(sfreq)
+            if cfg.data_mode == "windowed":
+                n_times_seen.add(Xs[0].shape[1])
+            print(f"  [ok]   {trial_id}: {len(Xs):3d} {'windows' if cfg.data_mode == 'windowed' else 'trial'}, "
+                  f"label={label} ({CLASS_NAMES['physionet'][label]}), amp_rejected={n_rejected}")
+ 
+    if not X_parts:
+        raise RuntimeError("No usable PhysioNet data. Check the download path / network.")
+ 
+    y = np.array(y_parts, dtype=int)
+    subj_groups = np.array(subj_groups)
+    trial_groups = np.array(trial_groups)
+    mean_sfreq = float(np.mean(sfreqs_seen))
+    print(f"  [info] {len(np.unique(subj_groups))} subjects, "
+          f"{len(np.unique(trial_groups))} runs, classes={np.bincount(y, minlength=2)}")
+ 
+    if cfg.data_mode == "windowed":
+        if len(n_times_seen) > 1:
+            nt = min(n_times_seen)
+            print(f"  [warn] mixed window lengths {sorted(n_times_seen)}; cropping all to {nt}")
+            X_parts = [x[:, :nt] for x in X_parts]
+        X = np.stack(X_parts).astype(np.float32)
+        print(f"  [info] windowed X shape: {X.shape}")
+        return X, y, subj_groups, trial_groups, mean_sfreq
+ 
+    return X_parts, y, subj_groups, trial_groups, mean_sfreq
+ 
+ 
+def get_dataset(cfg: Config, target_sfreq: float):
+    if cfg.dataset == "physionet":
+        return build_physionet_dataset(cfg, target_sfreq)
+    return build_dataset(cfg, target_sfreq)
 
 def select_groups(subj_groups: np.ndarray, trial_groups: np.ndarray, cfg: Config) -> np.ndarray:
-    """
-    Pick which grouping array LeaveOneGroupOut should split on, based on cfg.cv_level: 'subject' groups 
-    or 'trial' groups. Note again that trial is for testing and creates leakage of other trials from
-    test participant.
-    """
     return subj_groups if cfg.cv_level == "subject" else trial_groups
 
-# =====================================================================================
+
+def inner_val_split(groups_tr: np.ndarray, y_tr: np.ndarray, cfg: Config):
+    """
+    Splits one fold's training data into fit / validation index arrays, by group,
+    so that early stopping and best-weight selection never see the held-out test
+    fold. Whole groups (subjects or trials, matching cfg.cv_level) go to one side
+    only. Retries with a different seed until the validation side has both classes.
+    """
+    idx = np.arange(len(groups_tr))
+    for attempt in range(50):
+        gss = GroupShuffleSplit(n_splits=1, test_size=cfg.val_fraction,
+                                random_state=cfg.seed + attempt)
+        fit_idx, val_idx = next(gss.split(idx, y_tr, groups_tr))
+        if len(np.unique(y_tr[val_idx])) == 2 and len(np.unique(y_tr[fit_idx])) == 2:
+            return fit_idx, val_idx
+    raise RuntimeError("Could not build a validation split containing both classes.")
+
+# Scoring and normalization helpers
+
+def safe_balanced_accuracy(y_true, y_pred):
+    """Mean of the two per-class recalls, so chance is 0.50 whatever the class
+    split. NaN when the held-out group has only one class (trial-level CV)."""
+    if len(np.unique(y_true)) < 2:
+        return np.nan
+    return balanced_accuracy_score(y_true, y_pred)
+
+
+def standardize_per_subject(feats, subj, trials):
+    """
+    Z-scores each feature within each subject. Uses no labels.
+
+    The subject's centre is the mean of its recordings' means, not the mean of
+    its windows, so a long document does not pull the centre toward its own
+    class.
+    """
+    out = np.asarray(feats, dtype=float).copy()
+    for s in np.unique(subj):
+        m = subj == s
+        rec_means = np.stack([out[m & (trials == t)].mean(axis=0)
+                              for t in np.unique(trials[m])])
+        centre = rec_means.mean(axis=0)
+        scale = np.sqrt(((out[m] - centre) ** 2).mean(axis=0)) + 1e-12
+        out[m] = (out[m] - centre) / scale
+    return out
+
+
+def centre_per_recording(feats, trials):
+    """Subtracts each recording's own mean from its windows' features. Uses no labels."""
+    out = np.asarray(feats, dtype=float).copy()
+    for t in np.unique(trials):
+        m = trials == t
+        out[m] -= out[m].mean(axis=0, keepdims=True)
+    return out
+
+
+def print_vs_chance(name, res):
+    """One summary line: balanced accuracy across held-out groups against 0.50."""
+    if res is None or "balanced_accuracy" not in res.columns:
+        return
+    bal = res["balanced_accuracy"].dropna()
+    if len(bal) == 0:
+        return
+    line = (f"  {name:8s} mean balanced acc = {bal.mean():.3f}   "
+            f"above 0.50: {(bal > 0.5).sum()} of {len(bal)}")
+    if len(bal) >= 6 and np.any(bal != 0.5):
+        from scipy.stats import wilcoxon
+        line += f"   Wilcoxon vs 0.50 p = {wilcoxon(bal - 0.5)[1]:.4f}"
+    print(line)
+
+
 # EEGNet (windowed only)
-# =====================================================================================
 
 def EEGNet(nb_classes=2, Chans=8, Samples=256,
            dropout_rate=0.5, kern_len=64, F1=8, D=2, F2=16, l2_reg=0.0):
-    """
-    Build the EEGNet architecture (Lawhern et al.) for binary classification on fixed-length windowed EEG.
-
-    Standard EEGNet structure: a temporal Conv2D (kern_len taps) to learn frequency filters, a depthwise Conv2D 
-    across all channels (Chans) to learn spatial filters per temporal filter, then a separable Conv2D to learn 
-    efficient temporal summaries, with average pooling and dropout between blocks for regularization. 
-    F1/D/F2 control the number of temporal filters, depth multiplier, and pointwise filters respectively.
-    kern_len is set relative to sampling rate at the call site (roughly half a second) so the temporal filters 
-    span a physiologically meaningful window regardless of sfreq.
-    """
     reg_kw = {"kernel_regularizer": l2(l2_reg)} if l2_reg > 0 else {}
     sep_reg_kw = ({"depthwise_regularizer": l2(l2_reg), "pointwise_regularizer": l2(l2_reg)}
                 if l2_reg > 0 else {})
@@ -732,40 +965,65 @@ def EEGNet(nb_classes=2, Chans=8, Samples=256,
 
 
 def zscore_per_trial(X):
-    """
-    Per-channel z-score normalization applied independently within each trial/window of a stacked (n, ch, T) array 
-    (mean/std computed over the time axis only, per channel, per trial).
-    """
+    """For a stacked (n, ch, T) array: per-channel z-score within each trial."""
     m = X.mean(axis=2, keepdims=True)
     s = X.std(axis=2, keepdims=True) + 1e-7
     return (X - m) / s
 
 
 def zscore_single_trial(trial: np.ndarray) -> np.ndarray:
-    """
-    Same normalization as zscore_per_trial, for one ragged (ch, T) array (full_trial mode, where trials can't be stacked 
-    into one batch). Used in full_trial mode, where trials have different lengths and cannot be stacked into one batch
-    for a vectorized z-score.
-    """
+    """Same normalization as zscore_per_trial, for one ragged (ch, T) array
+    (full_trial mode, where trials can't be stacked into one batch)."""
     m = trial.mean(axis=1, keepdims=True)
     s = trial.std(axis=1, keepdims=True) + 1e-7
     return (trial - m) / s
 
 
-def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float):
+def zscore_per_subject(X, subj):
     """
-    Train and evaluate EEGNet under leave-one-group-out cross-validation (group = subject or trial, per cfg.cv_level).
-
-    Per fold: z-scores the held-in and held-out data, builds a fresh EEGNet (so no weights leak across folds), applies 
-    balanced class weighting to counter any easy/hard label imbalance, and trains with early stopping on val_loss (where "val" 
-    is the held-out LOSO fold -- see README known limitations regarding restore_best_weights). kern_len is derived from
-    sfreq (~0.5s of taps) rather than hardcoded, so it stays meaningful across different sampling rates.
-
-    Loss curves for all folds are saved via plot_loss_curves. Returns a per-fold results DataFrame (group, n_test, accuracy, 
-    macro_f1) and a pooled confusion matrix across all folds.
+    For a stacked (n, ch, T) array: one mean and one std per channel per subject,
+    computed over all of that subject's windows. Uses no labels. Unlike
+    zscore_per_trial, a window with a stronger signal stays stronger.
     """
-    X = X[..., np.newaxis]
-    X = zscore_per_trial(X)
+    out = np.empty(X.shape, dtype=np.float32)
+    for s in np.unique(subj):
+        m = subj == s
+        mu = X[m].mean(axis=(0, 2), keepdims=True, dtype=np.float64)
+        sd = X[m].std(axis=(0, 2), keepdims=True, dtype=np.float64) + 1e-12
+        out[m] = ((X[m] - mu) / sd).astype(np.float32)
+    return out
+
+
+def zscore_per_subject_ragged(X_list, subj):
+    """Same as zscore_per_subject, for a ragged list of (ch, T) trials (full_trial mode)."""
+    out = [None] * len(X_list)
+    for s in np.unique(subj):
+        idx = np.where(subj == s)[0]
+        joined = np.concatenate([X_list[j] for j in idx], axis=1).astype(np.float64)
+        mu = joined.mean(axis=1, keepdims=True)
+        sd = joined.std(axis=1, keepdims=True) + 1e-12
+        for j in idx:
+            out[j] = ((X_list[j] - mu) / sd).astype(np.float32)
+    return out
+
+
+def deep_norm_note(cfg: Config) -> str:
+    return "z-scored per subject" if cfg.deep_norm == "subject" else "z-scored per window"
+
+
+def require_subj(subj):
+    if subj is None:
+        raise ValueError("deep_norm='subject' needs each window's subject; pass subj=...")
+    return np.asarray(subj)
+
+
+def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float, subj=None):
+    if cfg.deep_norm == "subject":
+        X = zscore_per_subject(X, require_subj(subj))[..., np.newaxis]
+    else:
+        X = X[..., np.newaxis]
+        X = zscore_per_trial(X)
+    print(f"  [eegnet] input {deep_norm_note(cfg)}")
     n_ch, n_t = X.shape[1], X.shape[2]
     kern_len = max(16, int(sfreq // 2))
 
@@ -775,7 +1033,12 @@ def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float):
     histories = {}
     for i, (tr, te) in enumerate(logo.split(X, y, groups), 1):
         test_group = np.unique(groups[te])[0]
-        Xtr, Xte, ytr, yte = X[tr], X[te], y[tr], y[te]
+        Xtr_all, Xte, ytr_all, yte = X[tr], X[te], y[tr], y[te]
+
+        # early stopping uses held-out training groups, never the test fold
+        fit_idx, val_idx = inner_val_split(groups[tr], ytr_all, cfg)
+        Xtr, ytr = Xtr_all[fit_idx], ytr_all[fit_idx]
+        Xval, yval = Xtr_all[val_idx], ytr_all[val_idx]
 
         tf.keras.utils.set_random_seed(cfg.seed)
 
@@ -799,7 +1062,7 @@ def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float):
 
         history = model.fit(
             Xtr, ytr,
-            validation_data=(Xte, yte),
+            validation_data=(Xval, yval),
             epochs=cfg.epochs, batch_size=cfg.batch_size,
             class_weight=class_weight, callbacks=[es], verbose=0,
         )
@@ -813,7 +1076,9 @@ def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float):
         acc = accuracy_score(yte, pred)
         f1 = f1_score(yte, pred, average="macro", zero_division=0)
         rows.append({"group": test_group, "n_test": len(yte),
-                     "accuracy": acc, "macro_f1": f1})
+                     "accuracy": acc,
+                     "balanced_accuracy": safe_balanced_accuracy(yte, pred),
+                     "macro_f1": f1})
         all_true.append(yte)
         all_pred.append(pred)
         print(f"  fold {i:2d}/{len(uniq)}  test={test_group}  "
@@ -828,19 +1093,10 @@ def run_eegnet_cv(X, y, groups, cfg: Config, sfreq: float):
                           labels=[0, 1])
     return res, cm
 
-# =====================================================================================
-# Baseline (band-power + logistic regression):
-# =====================================================================================
+# Baseline (band-power + logistic regression): works for ragged or
+# stacked X since it just iterates "for trial in X"
 
 def bandpower_features(X, sfreq):
-    """
-    Extract log band-power features for each trial/window as input to the logistic regression baseline.
-
-    For each trial, computes a Welch PSD per channel, then averages power within five standard EEG bands (delta 1-4Hz,
-    theta 4-8Hz, alpha 8-13Hz, beta 13-30Hz, gamma 30-40Hz) and log-transforms it (a small epsilon avoids log(0)). 
-    Features are concatenated across bands and channels into one flat vector per trial. Works on either a stacked
-    array or a ragged list, since it iterates trial-by-trial.
-    """
     from scipy.signal import welch
     bands = [(1, 4), (4, 8), (8, 13), (13, 30), (30, 40)]
     feats = []
@@ -854,16 +1110,18 @@ def bandpower_features(X, sfreq):
     return np.asarray(feats)
 
 
-def run_baseline_cv(X, y, groups, sfreq):
+def run_baseline_cv(X, y, groups, sfreq, blocks=None, feats=None):
     """
-    Train and evaluate the band-power + logistic regression baseline under leave-one-group-out cross-validation.
+    blocks (optional): each window's block in its participant's session (0-3,
+    or -1 if unknown). When given, the held-out group's accuracy is also
+    reported per block (acc_block0..3). Each block holds one difficulty, so a
+    model reading difficulty scores about the same in all four, while a model
+    reading session time gets blocks 0 and 3 right and blocks 1 and 2 wrong.
 
-    A simple baseline (standardized band-power features -> L2 logistic regression with balanced class weights) 
-    used as a sanity-check floor against which EEGNet and BIOT are compared: if the deep models can't beat this, they aren't 
-    learning anything the hand-crafted features didn't already capture. Returns a per-fold results DataFrame
-    (group, accuracy, macro_f1).
+    feats (optional): precomputed bandpower_features(X, sfreq).
     """
-    feats = bandpower_features(X, sfreq)
+    if feats is None:
+        feats = bandpower_features(X, sfreq)
     logo = LeaveOneGroupOut()
     rows = []
     for tr, te in logo.split(feats, y, groups):
@@ -874,22 +1132,100 @@ def run_baseline_cv(X, y, groups, sfreq):
         )
         clf.fit(feats[tr], y[tr])
         pred = clf.predict(feats[te])
-        rows.append({"group": test_group,
-                     "accuracy": accuracy_score(y[te], pred),
-                     "macro_f1": f1_score(y[te], pred, average="macro",
-                                          zero_division=0)})
+        row = {"group": test_group, "n_test": len(te),
+               "accuracy": accuracy_score(y[te], pred),
+               "balanced_accuracy": safe_balanced_accuracy(y[te], pred),
+               "macro_f1": f1_score(y[te], pred, average="macro",
+                                    zero_division=0)}
+        if blocks is not None:
+            for b in range(4):
+                m = blocks[te] == b
+                row[f"acc_block{b}"] = float((pred[m] == y[te][m]).mean()) if m.any() else np.nan
+        rows.append(row)
     return pd.DataFrame(rows)
 
-# =====================================================================================
-# BIOT:
-# =====================================================================================
+
+def print_block_breakdown(base_res, effort=False):
+    cols = [f"acc_block{b}" for b in range(4)]
+    if not all(c in base_res.columns for c in cols):
+        return
+    m = base_res[cols].mean()
+    se = base_res[cols].sem()
+    print("  Normal baseline, held-out subject's accuracy by session block (mean ± SE):")
+    for b, kind in enumerate(("easy", "hard", "easy", "hard")):
+        print(f"    block {b} ({kind} documents) = {m.iloc[b]:.3f} ± {se.iloc[b]:.3f}")
+    if effort:
+        print("    Reading: these are plain accuracies on Effort labels; compare the blocks")
+        print("             with each other. Similar values -> not tied to session position.")
+    else:
+        print("    Reading: all four similar -> difficulty.")
+        print("             blocks 0 and 3 high, blocks 1 and 2 low -> time in session.")
+
+
+def run_time_control_cv(feats, y, groups, blocks):
+    """
+    Leave-one-subject-out, with the training and test blocks chosen so that
+    time in the session cannot help.
+
+      split A: train on blocks 0 + 3 (easy first, hard last)
+               test on the held-out subject's blocks 1 + 2 (hard before easy)
+      split B: train on blocks 1 + 2 (hard before easy)
+               test on the held-out subject's blocks 0 + 3 (easy before hard)
+
+    Two scores per split, both on the held-out subject:
+      aligned = same blocks as training (time and difficulty agree)
+      opposed = the other two blocks (time and difficulty disagree)
+
+    Scores are balanced accuracy, so chance is exactly 0.50.
+    """
+    outer = np.isin(blocks, [0, 3])
+    inner = np.isin(blocks, [1, 2])
+
+    def score(clf, idx):
+        if len(idx) == 0 or len(np.unique(y[idx])) < 2:
+            return np.nan            # a whole block was lost for this subject
+        return balanced_accuracy_score(y[idx], clf.predict(feats[idx]))
+
+    def mean_or_nan(values):
+        values = [v for v in values if not np.isnan(v)]
+        return float(np.mean(values)) if values else np.nan
+
+    rows = []
+    for tr, te in LeaveOneGroupOut().split(feats, y, groups):
+        row = {"group": np.unique(groups[te])[0]}
+        for name, train_mask, test_mask in (("A", outer, inner), ("B", inner, outer)):
+            clf = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(max_iter=1000, class_weight="balanced"),
+            )
+            clf.fit(feats[tr[train_mask[tr]]], y[tr[train_mask[tr]]])
+            row[f"aligned_{name}"] = score(clf, te[train_mask[te]])
+            row[f"opposed_{name}"] = score(clf, te[test_mask[te]])
+        row["aligned"] = mean_or_nan([row["aligned_A"], row["aligned_B"]])
+        row["opposed"] = mean_or_nan([row["opposed_A"], row["opposed_B"]])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def print_time_control_summary(ctrl):
+    from scipy.stats import wilcoxon
+
+    opp = ctrl["opposed"].dropna()
+    print(f"  aligned (time and difficulty agree)    mean = {ctrl['aligned'].mean():.3f}")
+    print(f"  opposed (time and difficulty disagree) mean = {opp.mean():.3f}   "
+          f"subjects above 0.50: {(opp > 0.5).sum()} of {len(opp)}")
+    if len(opp) >= 6 and np.any(opp != 0.5):
+        stat, p = wilcoxon(opp - 0.5)
+        print(f"  opposed vs 0.50, Wilcoxon signed-rank: p = {p:.4f}")
+    else:
+        print("  (too few subjects for a significance test)")
+    print("  Reading: opposed clearly above 0.50 -> difficulty.")
+    print("           opposed below 0.50 while aligned is above -> time in session.")
+    print("           both near 0.50 -> nothing transfers across subjects.")
+
+# BIOT
 
 def get_chs_info(ch_names):
-    """
-    Build the per-channel metadata (name, kind, 3D scalp position) that InterpolatedBIOT needs to spatially 
-    interpolate our montage onto its canonical channel layout. Positions come from MNE's standard 10-20
-    montage, keyed by the electrode names in CH_MAP.
-    """
     montage = mne.channels.make_standard_montage("standard_1020")
     positions = montage.get_positions()["ch_pos"]
     return [
@@ -900,12 +1236,9 @@ def get_chs_info(ch_names):
 
 def build_biot_model(chs_info, sfreq, n_times, repo_id):
     """
-    Load InterpolatedBIOT with pretrained weights, spatially adapted to 8-channel montage via interpolation onto 
-    BIOT's canonical (bipolar) layout.
-
-    Falls back to a randomly-initialized InterpolatedBIOT (same architecture, untrained weights) if the pretrained 
-    checkpoint can't be downloaded, e.g. no network access, so a run degrades to from-scratch training rather than 
-    crashing. The fallback is logged.
+    Loads InterpolatedBIOT with pretrained weights, adapted to the channel
+    montage via spatial interpolation to BIOT's canonical (bipolar) layout.
+    Raises an error if the pretrained weights cannot be loaded.
     """
     try:
         model = InterpolatedBIOT.from_pretrained(
@@ -914,31 +1247,21 @@ def build_biot_model(chs_info, sfreq, n_times, repo_id):
         )
         print(f"  [biot] loaded pretrained weights from {repo_id}")
     except Exception as e:
-        print(f"  [biot] [warn] could not load pretrained weights ({e!r}); "
-              f"falling back to a randomly-initialized InterpolatedBIOT")
-        model = InterpolatedBIOT(
-            chs_info=chs_info, n_outputs=2, n_times=n_times, sfreq=sfreq,
-        )
+        print(f"  [biot] [warn] could not load pretrained weights ({e!r})")
+        raise
     return model
 
 
-def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
-    """
-    Fine-tune BIOT under leave-one-group-out cross-validation on fixed-length windowed data (batched training).
-
-    Per fold: optionally z-scores per trial (cfg.biot_normalize), builds a fresh pretrained-or-fallback BIOT model, 
-    applies balanced class weighting via a weighted CrossEntropyLoss, and fine-tunes with AdamW (gradient-clipped) for up 
-    to cfg.biot_epochs, tracking train/val loss each epoch and manually implementing early stopping. GPU is used automatically
-    if available, and cleared between folds to avoid memory accumulation across the LOSO loop.
-
-    Loss curves for all folds are saved via plot_loss_curves. Returns a per-fold results DataFrame (group, n_test, accuracy, 
-    macro_f1) and a pooled confusion matrix.
-    """
+def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info, subj=None):
+    """Batched BIOT training for uniform-length windowed data."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    norm_note = "z-scored" if cfg.biot_normalize else "raw scale"
+    norm_note = deep_norm_note(cfg) if cfg.biot_normalize else "raw scale"
     print(f"  [biot] training on device: {device}  (windowed, batched, {norm_note})")
 
     n_times = X.shape[2]
+    per_subject = cfg.biot_normalize and cfg.deep_norm == "subject"
+    if per_subject:
+        X = zscore_per_subject(X, require_subj(subj))
     logo = LeaveOneGroupOut()
     uniq = np.unique(groups)
     rows, all_true, all_pred = [], [], []
@@ -946,10 +1269,15 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
 
     for i, (tr, te) in enumerate(logo.split(X, y, groups), 1):
         test_group = np.unique(groups[te])[0]
-        Xtr, Xte, ytr, yte = X[tr], X[te], y[tr], y[te]
-        if cfg.biot_normalize:
-            Xtr = zscore_per_trial(Xtr)
+        Xtr_all, Xte, ytr_all, yte = X[tr], X[te], y[tr], y[te]
+        if cfg.biot_normalize and not per_subject:
+            Xtr_all = zscore_per_trial(Xtr_all)
             Xte = zscore_per_trial(Xte)
+
+        # early stopping uses held-out training groups, never the test fold
+        fit_idx, val_idx = inner_val_split(groups[tr], ytr_all, cfg)
+        Xtr, ytr = Xtr_all[fit_idx], ytr_all[fit_idx]
+        Xval, yval = Xtr_all[val_idx], ytr_all[val_idx]
 
         torch.manual_seed(cfg.seed)
         model = build_biot_model(chs_info, sfreq, n_times, cfg.biot_repo_id).to(device)
@@ -966,8 +1294,13 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
             torch.tensor(ytr, dtype=torch.long),
         )
         train_loader = DataLoader(train_ds, batch_size=cfg.biot_batch_size, shuffle=True)
-        Xte_t = torch.tensor(Xte, dtype=torch.float32).to(device)
-        yte_t = torch.tensor(yte, dtype=torch.long).to(device)
+        val_loader = DataLoader(
+            TensorDataset(torch.tensor(Xval, dtype=torch.float32),
+                          torch.tensor(yval, dtype=torch.long)),
+            batch_size=cfg.biot_batch_size * 4, shuffle=False)
+        test_loader = DataLoader(
+            TensorDataset(torch.tensor(Xte, dtype=torch.float32)),
+            batch_size=cfg.biot_batch_size * 4, shuffle=False)
 
         best_val_loss = float("inf")
         best_state = None
@@ -989,9 +1322,13 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
             train_loss_curve.append(float(np.mean(batch_losses)))
 
             model.eval()
+            val_sum, val_n = 0.0, 0
             with torch.no_grad():
-                val_out = model(Xte_t)
-                val_loss = loss_fn(val_out, yte_t).item()
+                for xb, yb in val_loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    val_sum += loss_fn(model(xb), yb).item() * len(yb)
+                    val_n += len(yb)
+            val_loss = val_sum / max(val_n, 1)
             val_loss_curve.append(val_loss)
 
             if val_loss < best_val_loss:
@@ -1009,13 +1346,18 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
             model.load_state_dict(best_state)
 
         model.eval()
+        preds = []
         with torch.no_grad():
-            pred = model(Xte_t).argmax(dim=1).cpu().numpy()
+            for (xb,) in test_loader:
+                preds.append(model(xb.to(device)).argmax(dim=1).cpu().numpy())
+        pred = np.concatenate(preds)
 
         acc = accuracy_score(yte, pred)
         f1 = f1_score(yte, pred, average="macro", zero_division=0)
         rows.append({"group": test_group, "n_test": len(yte),
-                     "accuracy": acc, "macro_f1": f1})
+                     "accuracy": acc,
+                     "balanced_accuracy": safe_balanced_accuracy(yte, pred),
+                     "macro_f1": f1})
         all_true.append(yte)
         all_pred.append(pred)
         print(f"  fold {i:2d}/{len(uniq)}  test={test_group}  "
@@ -1033,29 +1375,24 @@ def run_biot_cv_windowed(X, y, groups, cfg: Config, sfreq: float, chs_info):
     return res, cm
 
 
-def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info):
+def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info, subj=None):
     """
-    Fine-tune BIOT under leave-one-group-out cross-validation on variable-length full-trial data, one trial at 
-    a time (effective batch size 1) since ragged trial lengths can't be stacked into a batched tensor.
-
-    Mirrors run_biot_cv_windowed's training logic (per-trial normalization, balanced class weighting, AdamW with 
-    gradient clipping, manual early stopping on val_loss with in-memory best-state checkpointing) but loops
-    over individual trials both in training and validation, applying the per-sample class weight manually rather than 
-    via the loss function's built-in weight argument. representative_n_times (the median trial length) is used only to 
-    size the model at construction; actual forward passes use each trial's true length. Slower per epoch than the windowed
-    path due to the lack of batching.
-
-    Loss curves for all folds are saved via plot_loss_curves. Returns a per-fold results DataFrame (group, n_test, accuracy, 
-    macro_f1) and a pooled confusion matrix.
+    X is a ragged list of (n_ch, variable_T) float32 arrays -- trials are not
+    stacked into one batched tensor, since lengths differ. Trains one trial
+    at a time (effective batch size 1); slower per epoch than the windowed
+    version.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    norm_note = "z-scored" if cfg.biot_normalize else "raw scale"
+    norm_note = deep_norm_note(cfg) if cfg.biot_normalize else "raw scale"
     print(f"  [biot] training on device: {device}  (full-trial, batch size 1, {norm_note})")
 
     y = np.asarray(y)
     groups = np.asarray(groups)
     idx_all = np.arange(len(X))
     representative_n_times = int(np.median([x.shape[1] for x in X]))
+    per_subject = cfg.biot_normalize and cfg.deep_norm == "subject"
+    if per_subject:
+        X = zscore_per_subject_ragged(X, require_subj(subj))
 
     logo = LeaveOneGroupOut()
     uniq = np.unique(groups)
@@ -1064,14 +1401,21 @@ def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info):
 
     for i, (tr, te) in enumerate(logo.split(idx_all, y, groups), 1):
         test_group = np.unique(groups[te])[0]
-        Xtr = [X[j] for j in tr]
-        ytr = y[tr]
+        Xtr_all = [X[j] for j in tr]
+        ytr_all = y[tr]
         Xte = [X[j] for j in te]
         yte = y[te]
-        if cfg.biot_normalize:
+        if cfg.biot_normalize and not per_subject:
             # normalize once per fold, not per-epoch
-            Xtr = [zscore_single_trial(x) for x in Xtr]
+            Xtr_all = [zscore_single_trial(x) for x in Xtr_all]
             Xte = [zscore_single_trial(x) for x in Xte]
+
+        # early stopping uses held-out training groups, never the test fold
+        fit_idx, val_idx = inner_val_split(groups[tr], ytr_all, cfg)
+        Xtr = [Xtr_all[j] for j in fit_idx]
+        ytr = ytr_all[fit_idx]
+        Xval = [Xtr_all[j] for j in val_idx]
+        yval = ytr_all[val_idx]
 
         torch.manual_seed(cfg.seed)
         model = build_biot_model(chs_info, sfreq, representative_n_times, cfg.biot_repo_id).to(device)
@@ -1110,9 +1454,9 @@ def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info):
             model.eval()
             val_losses = []
             with torch.no_grad():
-                for j in range(len(Xte)):
-                    xb = torch.tensor(Xte[j], dtype=torch.float32).unsqueeze(0).to(device)
-                    yb = torch.tensor([yte[j]], dtype=torch.long).to(device)
+                for j in range(len(Xval)):
+                    xb = torch.tensor(Xval[j], dtype=torch.float32).unsqueeze(0).to(device)
+                    yb = torch.tensor([yval[j]], dtype=torch.long).to(device)
                     out = model(xb)
                     val_losses.append(loss_fn(out, yb).item())
             val_loss = float(np.mean(val_losses))
@@ -1144,7 +1488,9 @@ def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info):
         acc = accuracy_score(yte, pred)
         f1 = f1_score(yte, pred, average="macro", zero_division=0)
         rows.append({"group": test_group, "n_test": len(yte),
-                     "accuracy": acc, "macro_f1": f1})
+                     "accuracy": acc,
+                     "balanced_accuracy": safe_balanced_accuracy(yte, pred),
+                     "macro_f1": f1})
         all_true.append(yte)
         all_pred.append(pred)
         print(f"  fold {i:2d}/{len(uniq)}  test={test_group}  "
@@ -1161,21 +1507,21 @@ def run_biot_cv_fulltrial(X, y, groups, cfg: Config, sfreq: float, chs_info):
                           labels=[0, 1])
     return res, cm
 
-# =====================================================================================
 # Outputs
-# =====================================================================================
+
+def save_result_csv(cfg: Config, name: str, res: pd.DataFrame):
+    """Writes one model's per-group results as soon as that model finishes,
+    so an interrupted run keeps what it already computed."""
+    out_dir = resolve_out_dir(cfg)
+    os.makedirs(out_dir, exist_ok=True)
+    tag = f"{cfg.data_mode}_{cfg.cv_level}"
+    path = os.path.join(out_dir, f"{name}_{tag}_accuracy.csv")
+    res.to_csv(path, index=False)
+    print(f"  [save] {path}")
+
 
 def save_outputs(cfg: Config, base_res, base_cm=None,
                   eeg_res=None, eeg_cm=None, biot_res=None, biot_cm=None):
-    """
-    Persist all per-run results to disk: per-fold accuracy CSVs for whichever models actually ran, a grouped 
-    bar chart comparing per-group accuracy across baseline/EEGNet/BIOT (with a chance-level reference line), and 
-    confusion matrix heatmaps for any model that produced one.
-
-    Output filenames are tagged with '<data_mode>_<cv_level>' so results from different config runs don't overwrite each other. 
-    The bar chart dynamically includes only the panels for models that were actually run (baseline always runs; EEGNet/BIOT are 
-    conditional on cfg.run_eegnet/cfg.run_biot).
-    """
     out_dir = resolve_out_dir(cfg)
     os.makedirs(out_dir, exist_ok=True)
     tag = f"{cfg.data_mode}_{cfg.cv_level}"
@@ -1186,7 +1532,7 @@ def save_outputs(cfg: Config, base_res, base_cm=None,
     if biot_res is not None:
         biot_res.to_csv(os.path.join(out_dir, f"biot_{tag}_accuracy.csv"), index=False)
 
-    # per-group accuracy bar chart
+    # per-group accuracy bar chart -- include whichever models actually ran
     panels = [("Baseline", base_res, "#8172B2")]
     if eeg_res is not None:
         panels.append(("EEGNet", eeg_res, "#4C72B0"))
@@ -1209,7 +1555,7 @@ def save_outputs(cfg: Config, base_res, base_cm=None,
     ax.set_ylabel(f"{cfg.cv_level}-level CV accuracy")
     ax.set_xlabel(f"held-out {cfg.cv_level}")
     ax.set_ylim(0, 1)
-    ax.set_title(f"Document-difficulty decoding — {cfg.data_mode}, leave-one-{cfg.cv_level}-out")
+    ax.set_title(f"{PLOT_TITLE[cfg.dataset]} — {cfg.data_mode}, leave-one-{cfg.cv_level}-out")
     ax.legend()
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f"per_group_accuracy_{tag}.png"), dpi=130)
@@ -1221,8 +1567,9 @@ def save_outputs(cfg: Config, base_res, base_cm=None,
         for (r, c), v in np.ndenumerate(cm):
             ax.text(c, r, str(v), ha="center", va="center",
                     color="white" if v > cm.max() / 2 else "black")
-        ax.set_xticks([0, 1], ["easy", "hard"])
-        ax.set_yticks([0, 1], ["easy", "hard"])
+        names = CLASS_NAMES[cfg.dataset]
+        ax.set_xticks([0, 1], names)
+        ax.set_yticks([0, 1], names)
         ax.set_xlabel("predicted")
         ax.set_ylabel("true")
         ax.set_title(title)
@@ -1240,25 +1587,9 @@ def save_outputs(cfg: Config, base_res, base_cm=None,
 
     print(f"\nSaved CSVs + plots to ./{out_dir}/")
 
-# =====================================================================================
 # Main
-# =====================================================================================
 
 def main(cfg: Config = None):
-    """
-    Run the full pipeline end-to-end for one Config: label pre-run check, dataset construction, model 
-    training/evaluation, and output saving.
-
-    Branches on cfg.data_mode:
-    - 'windowed': loads the dataset twice at two different sampling rates -- once at cfg.target_sfreq for 
-    EEGNet/baseline, once at cfg.biot_sfreq for BIOT, since each model expects its own native rate. Runs EEGNet 
-    (if enabled), the band-power baseline, and BIOT (if enabled) in turn, then prints a summary and saves all outputs.
-    - 'full_trial': loads the dataset once at cfg.biot_sfreq (EEGNet is force-disabled here since it requires fixed-length 
-    input). Runs BIOT (full-trial, batch-size-1 variant) and the band-power baseline, then summarizes and saves.
-
-    cfg.smoke, if set, restricts every loaded dataset to the first 3 subjects (after full discovery/labeling) for checking pipeline
-    functionality after changes without committing to a full run.
-    """
     cfg = CFG if cfg is None else cfg
     np.random.seed(cfg.seed)
     tf.keras.utils.set_random_seed(cfg.seed)
@@ -1270,15 +1601,36 @@ def main(cfg: Config = None):
         cfg.run_eegnet = False
 
     print("=" * 64)
-    print(f"CONFIG: data_mode={cfg.data_mode}  cv_level={cfg.cv_level}")
+    print(f"CONFIG: data_mode={cfg.data_mode}  cv_level={cfg.cv_level}  labels={cfg.label_source}")
     print("=" * 64)
 
-    print("\n" + "=" * 64)
-    print("FK-based label distribution pre-flight check")
-    print("=" * 64)
-    subjects = find_subjects(cfg)
-    fk_lookup, doc_fk_scores, threshold = load_fk_labels(cfg.labels_csv, cfg.fk_threshold)
-    check_fk_distribution(subjects, fk_lookup, doc_fk_scores, threshold)
+    if cfg.dataset == "physionet":
+        if cfg.cv_level != "subject":
+            # every run is one class, so a held-out run would be a single-class test set
+            print("[warn] PhysioNet runs are single-class; switching cv_level to 'subject'.")
+            cfg.cv_level = "subject"
+        if cfg.baseline_recording_norm:
+            # centring each run would subtract out the eyes-open/closed difference itself
+            print("[warn] baseline_recording_norm removes the class difference here; disabling.")
+            cfg.baseline_recording_norm = False
+        cfg.run_time_control = False # no session blocks in this dataset
+
+    if cfg.run_biot:
+        preflight_chs = get_chs_info(list(CH_MAP.values()))
+        preflight_n_times = int(round(cfg.window_s * cfg.biot_sfreq))
+        build_biot_model(preflight_chs, cfg.biot_sfreq,
+                         preflight_n_times, cfg.biot_repo_id)
+        print("[preflight] BIOT pretrained weights load OK")
+
+    block_of = {}
+    if cfg.dataset == "vixi":
+        print("\n" + "=" * 64)
+        print("FK-based label distribution pre-flight check")
+        print("=" * 64)
+        subjects = find_subjects(cfg)
+        fk_lookup, doc_fk_scores, threshold = load_fk_labels(cfg.labels_csv, cfg.fk_threshold)
+        check_fk_distribution(subjects, fk_lookup, doc_fk_scores, threshold)
+        block_of = session_blocks(subjects, fk_lookup, doc_fk_scores)
 
     def _apply_smoke(X, y, subj_g, trial_g):
         if not cfg.smoke:
@@ -1291,13 +1643,13 @@ def main(cfg: Config = None):
             X = X[m]
         return X, y[m], subj_g[m], trial_g[m]
 
-    eeg_res = eeg_cm = biot_res = biot_cm = None
+    eeg_res = eeg_cm = biot_res = biot_cm = ctrl = None
 
     if cfg.data_mode == "windowed":
         print("\n" + "=" * 64)
         print(f"Loading data (EEGNet-rate, target_sfreq={cfg.target_sfreq:.0f}Hz)")
         print("=" * 64)
-        Xe, ye, subj_e, trial_e, sfreq_e = build_dataset(cfg, target_sfreq=cfg.target_sfreq)
+        Xe, ye, subj_e, trial_e, sfreq_e = get_dataset(cfg, target_sfreq=cfg.target_sfreq)
         Xe, ye, subj_e, trial_e = _apply_smoke(Xe, ye, subj_e, trial_e)
         groups_e = select_groups(subj_e, trial_e, cfg)
         print(f"\nDataset: X={Xe.shape}  classes={np.bincount(ye)}  "
@@ -1307,20 +1659,59 @@ def main(cfg: Config = None):
             print("\n" + "=" * 64)
             print(f"EEGNet — leave-one-{cfg.cv_level}-out")
             print("=" * 64)
-            eeg_res, eeg_cm = run_eegnet_cv(Xe, ye, groups_e, cfg, sfreq_e)
+            eeg_res, eeg_cm = run_eegnet_cv(Xe, ye, groups_e, cfg, sfreq_e, subj=subj_e)
+            save_result_csv(cfg, "eegnet", eeg_res)
+
+        use_blocks = cfg.run_time_control and cfg.cv_level == "subject"
+        blocks_e = np.array([block_of.get(t, -1) for t in trial_e]) if use_blocks else None
+        feats_e = bandpower_features(Xe, sfreq_e)
+        if cfg.baseline_subject_norm:
+            feats_e = standardize_per_subject(feats_e, subj_e, trial_e)
+            print("\n  [norm] band-power features z-scored within each subject")
+        if cfg.baseline_recording_norm:
+            feats_e = centre_per_recording(feats_e, trial_e)
+            print("\n  [norm] band-power features centred within each recording")
 
         print("\n" + "=" * 64)
         print(f"Baseline (band-power + logistic regression) — leave-one-{cfg.cv_level}-out")
         print("=" * 64)
-        base_res = run_baseline_cv(Xe, ye, groups_e, sfreq_e)
+        base_res = run_baseline_cv(Xe, ye, groups_e, sfreq_e, blocks=blocks_e, feats=feats_e)
         for _, r in base_res.iterrows():
-            print(f"  test={r['group']}  acc={r['accuracy']:.3f}")
+            print(f"  test={r['group']}  acc={r['accuracy']:.3f}  "
+                  f"bal={r['balanced_accuracy']:.3f}")
+        save_result_csv(cfg, "baseline", base_res)
+
+        if use_blocks:
+            print("\n" + "=" * 64)
+            if cfg.label_source == "effort":
+                print("Effort labels and position in the session (band-power + logistic regression)")
+            else:
+                print("Difficulty vs time in session (band-power + logistic regression)")
+            print("=" * 64)
+            n_unknown = int((blocks_e < 0).sum())
+            if n_unknown:
+                print(f"  [order] {n_unknown} of {len(blocks_e)} windows have no block and are left out")
+            if cfg.label_source == "effort":
+                # Effort varies inside every block, so the opposed-blocks control does
+                # not apply; instead, check whether Effort itself drifts over the session.
+                print_block_breakdown(base_res, effort=True)
+                shares = [float(ye[blocks_e == b].mean()) if (blocks_e == b).any() else np.nan
+                          for b in range(4)]
+                print("  Share of high-effort windows in blocks 0-3: "
+                      + "  ".join(f"{s:.3f}" for s in shares))
+                print("    Similar shares -> session position cannot stand in for the label.")
+            else:
+                print_block_breakdown(base_res)
+                print()
+                ctrl = run_time_control_cv(feats_e, ye, groups_e, blocks_e)
+                print_time_control_summary(ctrl)
+                save_result_csv(cfg, "time_control", ctrl)
 
         if cfg.run_biot:
             print("\n" + "=" * 64)
             print(f"Loading data (BIOT-rate, target_sfreq={cfg.biot_sfreq:.0f}Hz)")
             print("=" * 64)
-            Xb, yb, subj_b, trial_b, sfreq_b = build_dataset(cfg, target_sfreq=cfg.biot_sfreq)
+            Xb, yb, subj_b, trial_b, sfreq_b = get_dataset(cfg, target_sfreq=cfg.biot_sfreq)
             Xb, yb, subj_b, trial_b = _apply_smoke(Xb, yb, subj_b, trial_b)
             groups_b = select_groups(subj_b, trial_b, cfg)
             print(f"\nBIOT dataset: X={Xb.shape}  classes={np.bincount(yb)}  "
@@ -1330,7 +1721,9 @@ def main(cfg: Config = None):
             print("\n" + "=" * 64)
             print(f"BIOT (pretrained, fine-tuned) — windowed, leave-one-{cfg.cv_level}-out")
             print("=" * 64)
-            biot_res, biot_cm = run_biot_cv_windowed(Xb, yb, groups_b, cfg, sfreq_b, chs_info)
+            biot_res, biot_cm = run_biot_cv_windowed(Xb, yb, groups_b, cfg, sfreq_b, chs_info,
+                                                     subj=subj_b)
+            save_result_csv(cfg, "biot", biot_res)
 
         print("\n" + "=" * 64)
         print("SUMMARY")
@@ -1346,6 +1739,12 @@ def main(cfg: Config = None):
                   f"± {biot_res['accuracy'].std():.3f}   "
                   f"mean macro-F1 = {biot_res['macro_f1'].mean():.3f}")
         print(f"  Chance ≈ {max(np.bincount(ye)) / len(ye):.3f} (majority class)")
+        print_vs_chance("EEGNet", eeg_res)
+        print_vs_chance("Baseline", base_res)
+        print_vs_chance("BIOT", biot_res)
+        if ctrl is not None:
+            print(f"  Time control (baseline): aligned = {ctrl['aligned'].mean():.3f}   "
+                  f"opposed = {ctrl['opposed'].mean():.3f}   (chance 0.500)")
 
         save_outputs(cfg, base_res, eeg_res=eeg_res, eeg_cm=eeg_cm,
                      biot_res=biot_res, biot_cm=biot_cm)
@@ -1354,7 +1753,7 @@ def main(cfg: Config = None):
         print("\n" + "=" * 64)
         print(f"Loading data (full-trial, no windowing, target_sfreq={cfg.biot_sfreq:.0f}Hz)")
         print("=" * 64)
-        X, y, subj_g, trial_g, sfreq = build_dataset(cfg, target_sfreq=cfg.biot_sfreq)
+        X, y, subj_g, trial_g, sfreq = get_dataset(cfg, target_sfreq=cfg.biot_sfreq)
         X, y, subj_g, trial_g = _apply_smoke(X, y, subj_g, trial_g)
         groups = select_groups(subj_g, trial_g, cfg)
         print(f"\nDataset: {len(X)} trials  classes={np.bincount(y)}  "
@@ -1366,14 +1765,23 @@ def main(cfg: Config = None):
             print("\n" + "=" * 64)
             print(f"BIOT (pretrained, fine-tuned) — full-trial, leave-one-{cfg.cv_level}-out")
             print("=" * 64)
-            biot_res, biot_cm = run_biot_cv_fulltrial(X, y, groups, cfg, sfreq, chs_info)
+            biot_res, biot_cm = run_biot_cv_fulltrial(X, y, groups, cfg, sfreq, chs_info,
+                                                      subj=subj_g)
 
         print("\n" + "=" * 64)
         print(f"Baseline (band-power + logistic regression) — full-trial, leave-one-{cfg.cv_level}-out")
         print("=" * 64)
-        base_res = run_baseline_cv(X, y, groups, sfreq)
+        feats = bandpower_features(X, sfreq)
+        if cfg.baseline_subject_norm:
+            feats = standardize_per_subject(feats, subj_g, trial_g)
+            print("  [norm] band-power features z-scored within each subject")
+        if cfg.baseline_recording_norm:
+            feats = centre_per_recording(feats, trial_g)
+            print("  [norm] band-power features centred within each recording")
+        base_res = run_baseline_cv(X, y, groups, sfreq, feats=feats)
         for _, r in base_res.iterrows():
-            print(f"  test={r['group']}  acc={r['accuracy']:.3f}")
+            print(f"  test={r['group']}  acc={r['accuracy']:.3f}  "
+                  f"bal={r['balanced_accuracy']:.3f}")
 
         print("\n" + "=" * 64)
         print("SUMMARY")
@@ -1390,9 +1798,31 @@ def main(cfg: Config = None):
 
 
 if __name__ == "__main__":
-    # Edit CFG.data_mode / CFG.cv_level here
+    # Example runs (uncomment one):
     #   main(Config(data_mode="windowed", cv_level="subject"))
     #   main(Config(data_mode="windowed", cv_level="trial"))
     #   main(Config(data_mode="full_trial", cv_level="subject"))
     #   main(Config(data_mode="full_trial", cv_level="trial"))
-    main(Config(data_mode="windowed", cv_level="trial"))
+    #
+    # Baseline + difficulty-vs-time control:
+    #   main(Config(data_mode="windowed", cv_level="subject",
+    #               run_eegnet=False, run_biot=False, smoke=False))
+    # With band-power features z-scored within each subject:
+    #   main(Config(data_mode="windowed", cv_level="subject",
+    #               run_eegnet=False, run_biot=False, smoke=False,
+    #               baseline_subject_norm=True))
+    # BIOT only:
+    #   main(Config(data_mode="windowed", cv_level="subject", run_eegnet=False))
+    #
+    # Self-rated Effort per paragraph as the label, baseline model only:
+    #   main(Config(data_mode="windowed", cv_level="subject", run_eegnet=False,
+    #               run_biot=False, smoke=False, label_source="effort"))
+    # All three models on Effort labels, with and without per-subject normalization:
+    #    main(Config(data_mode="windowed", cv_level="subject", smoke=False,
+    #             label_source="effort"))
+    #    main(Config(data_mode="windowed", cv_level="subject", smoke=False,
+    #             label_source="effort", deep_norm="subject"))
+    # PhysioNet positive control (eyes open vs eyes closed):
+    main(Config(dataset="physionet", data_mode="windowed", cv_level="subject",
+        run_eegnet=True, run_biot=True, smoke=True, physionet_subjects=tuple(range(1, 31)),
+        out_dir_base="results_sub30"))

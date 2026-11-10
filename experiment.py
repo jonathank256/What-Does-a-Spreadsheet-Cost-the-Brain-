@@ -13,53 +13,53 @@ import string
 # =========================
 # CONFIG
 # =========================
-N_ROWS = 16 # rows in stimuli tables
-N_COLS = 16 # columns in stimuli tables
-FIXATION_DURATION_SEC = 1.5 # fixation between trials
-USE_TRIGGERS = False # False without hardware, True with
-EYE_TRACKING = False # if eye-tracking
-USE_EEG = False # if EEG
-EEG_STREAM_NAME = "gNautilus" # default LSL stream. may need to update. "g.NEEDaccess client"
+N_ROWS = 16 # rows in ALL stimuli tables
+N_COLS = 16 # columns in ALL stimuli tables
+FIXATION_DURATION_SEC = 1.5 # fixation in seconds between trials
+USE_TRIGGERS = False # Hardware trigger toggle for fNIRS and EEG
+EYE_TRACKING = False # Activates eye-tracking setup
+USE_EEG = False # Activates EEG functionality
+EEG_STREAM_NAME = "gNautilus" # default LSL stream, can be changed for different hardware, functionality not guaranteed
 EEG_STREAM_TYPE = "EEG"
-EEG_N_CHANNELS = 16 # may be 8 or 16 depending on strand use. defaulting to maximum
-EEG_CONNECT_TIMEOUT_SEC = 10 # how long to wait for stream at startup
-RUN_INSTRUCTION_PHASE = True # False to skip instructions/demos (e.g. for testing)
+EEG_N_CHANNELS = 16 # The number of EEG channels to look for
+EEG_CONNECT_TIMEOUT_SEC = 10 # How long to wait for stream at startup
+RUN_INSTRUCTION_PHASE = True # Set this to false to skip practice trials and instructions
 
 DATA_DIR = "psychopy_output"
-STIM_DIR = os.path.join(DATA_DIR, "stimuli_csv") # saving stimuli tables
-RESULTS_DIR = os.path.join(DATA_DIR, "results") # results location
-# ensuring these directories exist
+STIM_DIR = os.path.join(DATA_DIR, "stimuli_csv") # Where to save all of the stimuli tables presented
+RESULTS_DIR = os.path.join(DATA_DIR, "results") # Where to save results .csvs
+
 os.makedirs(STIM_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # =========================
 # TRIAL SETTINGS
 # =========================
-TRIAL_DURATION_SEC = 30
-N_TRIAL_REPEATS = 1
-BREAK_DURATION_SEC = 5
+TRIAL_DURATION_SEC = 30 # How long trials will last
+N_TRIAL_REPEATS = 1 # How many repetitions of all trial types will occur
+BREAK_DURATION_SEC = 5 # How long breaks will last between blocks of all trials
 FULLSCREEN = True
 WINDOW_SIZE = [2560, 1600]
 
 # =========================
 # TESTING / ORDER CONTROL
 # =========================
-FORCE_FIRST_BLOCK_ENABLED = False # allows for control over starting trial, debug
-FORCE_FIRST_BLOCK = ("spatial", "hard") # set which to force
+FORCE_FIRST_BLOCK_ENABLED = False # Debug, set first trial type
+FORCE_FIRST_BLOCK = ("spatial", "hard") # Set forced trial type
 RUN_ONLY_FORCED_BLOCK = False
 FIXED_BLOCK_ORDER = False
 
 # Spatial Settings
-SPATIAL_EASY_TARGET_COLOR = "#0055CC"
+SPATIAL_EASY_TARGET_COLOR = "#0055CC" # Sets the color type for both spatial easy and hard
 
 # Visibility Settings
-VISIBILITY_EASY_TARGET_COLOR     = "black"
+VISIBILITY_EASY_TARGET_COLOR = "black"
 VISIBILITY_EASY_DISTRACTOR_COLOR = "#8E8E8E"
-VISIBILITY_HARD_TARGET_COLOR     = "#CECECE"
+VISIBILITY_HARD_TARGET_COLOR = "#CECECE"
 VISIBILITY_HARD_DISTRACTOR_COLOR = "#D8D8D8"
 
 # =========================
-# LSL TRIGGER STREAM (NIRSport 2 via USB)
+# LSL TRIGGER STREAM (used NIRSport 2)
 # =========================
 outlet = None
 if USE_TRIGGERS:
@@ -73,10 +73,10 @@ if USE_TRIGGERS:
         source_id="psychopy_exp"
     )
     outlet = StreamOutlet(info)
-    core.wait(3)   # give Aurora time to discover the stream before first trigger
+    core.wait(3)
 
 # =========================
-# EEG (g.tec gNautilus, LSL)
+# EEG (used gNautilus, LSL)
 # =========================
 eeg_inlet = None
 
@@ -85,9 +85,8 @@ if USE_EEG:
 
     def connect_eeg_stream(timeout=EEG_CONNECT_TIMEOUT_SEC):
         """
-        Discover gNautilus stream, return an inlet.
-        g.NEEDaccess must be running AND streaming before this is called,
-        returns None if not found before timeout.
+        Discover gNautilus stream, return an inlet. g.NEEDaccess must be running and streaming before this is called,
+        return None if timeout.
         """
         print(f"[EEG] Searching for LSL stream '{EEG_STREAM_NAME}' (type='{EEG_STREAM_TYPE}')...")
         streams = resolve_byprop("name", EEG_STREAM_NAME, timeout=timeout)
@@ -104,7 +103,6 @@ if USE_EEG:
         return inlet
 
     def check_eeg_stream_alive(inlet):
-        """Non-blocking pull to verify samples are working."""
         if inlet is None:
             return False
         sample, _ = inlet.pull_sample(timeout=0.5)
@@ -113,7 +111,7 @@ if USE_EEG:
 # =========================
 # Eye Tracking
 # =========================
-el = None  # this is assigned in main() after win is created
+el = None  # Assigned in main after win created
 
 if EYE_TRACKING:
     import pylink
@@ -123,6 +121,7 @@ if EYE_TRACKING:
 # TRIGGER BASE CODES
 # =========================
 # Composite trigger = round_num * 10000 + response_count * 100 + base_code
+# This means that round_num is 5th, potentially 6th digits, response_count for trial is 3rd, 4th if 10+, and base_code (trial type) is 1st, 2nd
 #
 # Onsets and timeouts use response_count = 0
 # Examples:
@@ -133,8 +132,7 @@ if EYE_TRACKING:
 # computation easy response round 1, 23rd correct: 1*10000 + 23*100 + 51 = 12351
 #
 # Demo triggers use round_num = 0 and response_count = 0: equals base_code only.
-# NOTE: All real trial codes are >= 10011, so demo codes (11-92) are unambiguous.
-#
+
 TRIGGER_CODES = {
     ("spatial",     "easy",  "onset"   ): 11,
     ("spatial",     "hard",  "onset"   ): 12,
@@ -304,6 +302,9 @@ def index_to_letter(i):
     return result
 
 def build_trial_sequence():
+    """ 
+    Randomizes the trial sequence for each full block of trials. 
+    """
     base_conditions = get_all_trial_conditions()
     full_sequence = []
     previous_order = None
@@ -321,6 +322,10 @@ def build_trial_sequence():
     return full_sequence
 
 def generate_dataset(task_type, difficulty, n_rows=N_ROWS, n_cols=N_COLS):
+    """ 
+    Generates random tables for each task type based on task constraints. Each table has specific 
+    values that are allowed to be generated, controlled by the various functions present here.
+    """
     data = []
 
     for _ in range(n_rows):
@@ -346,6 +351,9 @@ def generate_dataset(task_type, difficulty, n_rows=N_ROWS, n_cols=N_COLS):
     return data
 
 def save_dataset_csv(filename, data):
+    """
+    Each generated dataset is saved for later analysis.
+    """
     headers = make_headers(len(data[0]))
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
@@ -434,7 +442,7 @@ def make_spatial_hard_color_grid(n_rows, n_cols):
 def make_spatial_hard_target(data, color_grid):
     """
     Picks a random cell; its color from color grid is part
-    of the target definition, i.e. must pick right number and color.
+    of the target definition, must pick right number and color.
     """
     r = random.randrange(len(data))
     c = random.randrange(len(data[0]))
@@ -534,6 +542,10 @@ def break_screen(win, block_name, seconds=BREAK_DURATION_SEC):
             core.quit()
 
 def build_table_stimuli(win, data, task_type=None, difficulty=None, cell_colors=None):
+    """
+    Builds the presented stimuli based on trial type constraints, including the cell colours, the lines,
+    and the labelled axes.
+    """
     n_rows = len(data)
     n_cols = len(data[0])
 
@@ -622,14 +634,14 @@ def build_table_stimuli(win, data, task_type=None, difficulty=None, cell_colors=
             )
 
             clickable_cells.append({
-                "row":       r,
-                "col":       c,
+                "row": r,
+                "col": c,
                 "row_label": index_to_letter(r),
                 "col_label": index_to_letter(c),
-                "value":     data[r][c],
-                "color":     txt_color,
-                "rect":      rect,
-                "text":      txt
+                "value": data[r][c],
+                "color": txt_color,
+                "rect": rect,
+                "text": txt
             })
 
     return static_stims, clickable_cells
@@ -645,6 +657,9 @@ def _make_odd(v):
     return max(11, min(99, v))
 
 def assign_spatial_features(data, target):
+    """
+    Only one target is a different colour in this condition.
+    """
     tr, tc = target["row"], target["col"]
 
     if target.get("difficulty") == "easy":
@@ -658,6 +673,9 @@ def assign_spatial_features(data, target):
     return None, data
 
 def reassign_target_feature(data, cell_lookup, old_target, new_target, difficulty):
+    """
+    Moves target feature. Called after target is correctly located and clicked.
+    """
     if difficulty == "easy":
         otr, otc = old_target["row"], old_target["col"]
         ntr, ntc = new_target["row"], new_target["col"]
@@ -676,6 +694,9 @@ def reassign_target_feature(data, cell_lookup, old_target, new_target, difficult
     return new_target
 
 def draw_table_stimuli(static_stims, clickable_cells):
+    """
+    Draws all features. 
+    """
     for stim in static_stims:
         stim.draw()
     for cell in clickable_cells:
@@ -683,6 +704,9 @@ def draw_table_stimuli(static_stims, clickable_cells):
         cell["text"].draw()
 
 def point_in_cell(mouse_pos, cell, padding=0.005):
+    """
+    Tracks mouse location to allow clickable elements. 
+    """
     x, y = mouse_pos
     cx, cy = cell["rect"].pos
     hw = cell["rect"].width / 2 + padding
