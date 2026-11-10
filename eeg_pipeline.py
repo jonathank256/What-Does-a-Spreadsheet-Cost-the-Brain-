@@ -601,6 +601,7 @@ def load_subject(eeg_csv: str, ann_path: str, cfg: Config, doc_label: int, targe
 
 
 # Dataset assembly: returns BOTH subject-level and trial-level group
+<<<<<<< HEAD
 # arrays, so cv_level can be chosen at train time without
 # rebuilding the dataset.
 
@@ -636,6 +637,10 @@ def effort_cuts(subjects):
               f"({100 * (vals > cut).mean():.0f}% of {len(vals)} paragraphs)")
     return cuts
 
+=======
+# arrays , so cv_level can be chosen at train time without
+# rebuilding the dataset.
+>>>>>>> b467f421300bdd44707856c733aa5b2a301397e9
 
 def build_dataset(cfg: Config, target_sfreq: float):
     subjects = find_subjects(cfg)
@@ -867,7 +872,11 @@ def select_groups(subj_groups: np.ndarray, trial_groups: np.ndarray, cfg: Config
 
 def inner_val_split(groups_tr: np.ndarray, y_tr: np.ndarray, cfg: Config):
     """
+<<<<<<< HEAD
     Splits one fold's training data into fit / validation index arrays, by group,
+=======
+    Splits one fold's TRAINING data into fit / validation index arrays, by group,
+>>>>>>> b467f421300bdd44707856c733aa5b2a301397e9
     so that early stopping and best-weight selection never see the held-out test
     fold. Whole groups (subjects or trials, matching cfg.cv_level) go to one side
     only. Retries with a different seed until the validation side has both classes.
